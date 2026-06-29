@@ -13,7 +13,7 @@ static ssize_t mirage_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 }
 
 /* Address space operations are required for certain VFS checks */
-const struct address_space_operations nomount_aops = {
+const struct address_space_operations mirage_aops = {
 	.direct_IO = mirage_direct_IO,
 };
 

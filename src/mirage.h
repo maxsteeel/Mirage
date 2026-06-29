@@ -140,11 +140,10 @@ struct mirage_sb_info {
 	 * Store the strings from the mount options directly instead. */
 	char lower_path_strs[MIRAGE_MAX_BRANCHES][PATH_MAX];
 	char inject_path_str[PATH_MAX];
-	struct file_system_type *fake_type; /* For export operations to identify the filesystem type */
 };
 
 /* Structure to safely pass assembly data to fill_super */
-struct nomount_mount_data {
+struct mirage_mount_data {
 	const char *dev_name;
 	void *raw_data;
 };
@@ -153,7 +152,7 @@ struct nomount_mount_data {
  * Inode to private data conversion.
  * Since struct inode is embedded, this will always return a valid pointer.
  */
-static inline struct nomount_inode_info *mirage_inode(const struct inode *inode)
+static inline struct mirage_inode_info *mirage_inode(const struct inode *inode)
 {
 	return container_of(inode, struct mirage_inode_info, vfs_inode);
 }

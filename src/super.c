@@ -10,27 +10,45 @@
 
 static struct kmem_cache *mirage_inode_cachep;
 
+#define MAX_SPOOF_TYPES 8
+static struct file_system_type mirage_spoof_types[MAX_SPOOF_TYPES];
+static DEFINE_SPINLOCK(spoof_lock);
+
+static struct file_system_type *mirage_get_spoof_type(const char *real_name) 
+{
+    int i;
+
+    if (!real_name) return &mirage_fs_type;
+
+    spin_lock(&spoof_lock);
+
+    for (i = 0; i < MAX_SPOOF_TYPES; i++) {
+        if (mirage_spoof_types[i].name && strcmp(mirage_spoof_types[i].name, real_name) == 0) {
+            spin_unlock(&spoof_lock);
+            return &mirage_spoof_types[i];
+        }
+    }
+
+    for (i = 0; i < MAX_SPOOF_TYPES; i++) {
+        if (!mirage_spoof_types[i].name) {
+            mirage_spoof_types[i] = mirage_fs_type;
+            mirage_spoof_types[i].name = real_name;
+            spin_unlock(&spoof_lock);
+            return &mirage_spoof_types[i];
+        }
+    }
+
+    spin_unlock(&spoof_lock);
+    return &mirage_fs_type;
+}
+
 /* * mirage_evict_inode: Called when an inode is being removed from memory.
  */
 static void mirage_evict_inode(struct inode *inode)
 {
 	struct inode *lower_inode;
-	struct mirage_inode_info *mii = mirage_inode(inode);
-	struct mirage_dirent *md, *tmp;
-
-	/* Clean up cached directory entries */
-	mutex_lock(&mii->readdir_mutex);
-	list_for_each_entry_safe(md, tmp, &mii->dirents_list, list) {
-		hash_del(&md->hash);
-		list_del(&md->list);
-		kfree(md);
-	}
-	mutex_unlock(&mii->readdir_mutex);
-
 	truncate_inode_pages(&inode->i_data, 0);
 	clear_inode(inode);
-
-	/* Get the real inode and release it */
 	lower_inode = mirage_lower_inode(inode);
 	set_lower_inode(inode, NULL);
 	iput(lower_inode);
@@ -47,11 +65,6 @@ static struct inode *mirage_alloc_inode(struct super_block *sb)
 		return NULL;
 
 	/* Initialize private data and VFS inode */
-
-	/* * FIX: Because vfs_inode is now at offset 0, we must clear 
-	 *  everything AFTER the vfs_inode to prevent leaving garbage data 
-	 *  in the lower_inode pointer.
-	 */
 	memset((char *)i + sizeof(struct inode), 0, sizeof(*i) - sizeof(struct inode));
 	mirage_set_iversion(&i->vfs_inode, 1);
 
@@ -67,7 +80,7 @@ static struct inode *mirage_alloc_inode(struct super_block *sb)
 static void mirage_i_callback(struct rcu_head *head)
 {
 	struct inode *inode = container_of(head, struct inode, i_rcu);
-	kmem_cache_free(mirage_inode_cachep, MIRAGE_I(inode));
+	kmem_cache_free(mirage_inode_cachep, mirage_inode(inode));
 }
 
 static void mirage_destroy_inode(struct inode *inode)
@@ -78,7 +91,7 @@ static void mirage_destroy_inode(struct inode *inode)
 
 /* * mirage_put_super: Final cleanup during unmount.
  */
-void mirage_put_super(struct super_block *sb)
+static void mirage_put_super(struct super_block *sb)
 {
 	struct mirage_sb_info *sbi = mirage_sb(sb);
 	int i;
@@ -94,9 +107,6 @@ void mirage_put_super(struct super_block *sb)
 
 	if (sbi->has_inject)
 		path_put(&sbi->inject_path);
-
-	if (sbi->fake_type)
-		kfree(sbi->fake_type);
 
 	kfree(sbi);
 	sb->s_fs_info = NULL;
@@ -268,9 +278,9 @@ static int mirage_parse_options(struct super_block *sb, struct mirage_mount_opts
 
 	/* Update superblock ID so /proc/mounts displays it pretty */
 	if (parsed_opts->path_to_mount && *parsed_opts->path_to_mount)
-		strlcpy(sb->s_id, parsed_opts->path_to_mount, sizeof(sb->s_id));
+		strscpy(sb->s_id, parsed_opts->path_to_mount, sizeof(sb->s_id));
 	else if (parsed_opts->source_str && *parsed_opts->source_str)
-		strlcpy(sb->s_id, parsed_opts->source_str, sizeof(sb->s_id));
+		strscpy(sb->s_id, parsed_opts->source_str, sizeof(sb->s_id));
 
 	return 0;
 }
@@ -301,7 +311,7 @@ static int mirage_setup_direct_inject(struct mirage_sb_info *sbi, struct mirage_
 	}
 
 	/* Store the target filename for lookup interception */
-	strlcpy(sbi->inject_name, target_path.dentry->d_name.name,
+	strscpy(sbi->inject_name, target_path.dentry->d_name.name,
 		sizeof(sbi->inject_name));
 	sbi->inject_name_len = strlen(sbi->inject_name);
 	sbi->inject_name_hash = full_name_hash(NULL, sbi->inject_name, sbi->inject_name_len);
@@ -369,7 +379,7 @@ static int mirage_setup_branches(struct mirage_sb_info *sbi, struct mirage_mount
 		/* raw.mnt ref is now owned by the private clone; release it.
 		 * NOTE: Use path_put instead of mntput to prevent dentry memory leaks */
 		path_put(&raw);
-		strlcpy(sbi->lower_path_strs[sbi->num_lower_paths],
+		strscpy(sbi->lower_path_strs[sbi->num_lower_paths],
 			opts->upperdir_str, PATH_MAX);
 		sbi->num_lower_paths++;
                 sbi->has_upperdir = true;
@@ -381,7 +391,7 @@ static int mirage_setup_branches(struct mirage_sb_info *sbi, struct mirage_mount
 		while ((branch_str = strsep(&branch_ptr, ":")) != NULL) {
 			struct path raw;
 			if (!*branch_str) continue;
-			if (sbi->num_lower_paths >= NOMOUNT_MAX_BRANCHES) {
+			if (sbi->num_lower_paths >= MIRAGE_MAX_BRANCHES) {
 				return -EINVAL;
 			}
 			err = kern_path(branch_str, LOOKUP_FOLLOW, &raw);
@@ -399,7 +409,7 @@ static int mirage_setup_branches(struct mirage_sb_info *sbi, struct mirage_mount
 			}
 			/* NOTE: Use path_put to balance the kern_path references */
 			path_put(&raw);
-			strlcpy(sbi->lower_path_strs[sbi->num_lower_paths],
+			strscpy(sbi->lower_path_strs[sbi->num_lower_paths],
 				branch_str, PATH_MAX);
 			sbi->num_lower_paths++;
 		}
@@ -449,10 +459,10 @@ static int mirage_setup_branches(struct mirage_sb_info *sbi, struct mirage_mount
 			return err;
 		}
 		path_put(&raw);
-		strlcpy(sbi->inject_name, opts->inject_name_str, sizeof(sbi->inject_name));
+		strscpy(sbi->inject_name, opts->inject_name_str, sizeof(sbi->inject_name));
 		sbi->inject_name_len = strlen(sbi->inject_name);
 		sbi->inject_name_hash = full_name_hash(NULL, sbi->inject_name, sbi->inject_name_len);
-		strlcpy(sbi->inject_path_str, opts->inject_path_str, PATH_MAX);
+		strscpy(sbi->inject_path_str, opts->inject_path_str, PATH_MAX);
 		sbi->has_inject = true;
 	}
 
@@ -480,16 +490,16 @@ static int mirage_setup_superblock(struct super_block *sb, struct mirage_sb_info
 		return -EINVAL;
 	}
 
-	sb->s_op = &nomount_sops;
-	sb->s_d_op = &nomount_dops;
-	sb->s_export_op = &nomount_export_ops;
-	sb->s_xattr = nomount_xattr_handlers;
+	sb->s_op = &mirage_sops;
+	sb->s_d_op = &mirage_dops;
+	sb->s_export_op = &mirage_export_ops;
+	sb->s_xattr = mirage_xattr_handlers;
 
 	/*
 	 * Always use our own magic number. Spoofing the lower filesystem's
 	 * magic (e.g. ext4's 0xEF53) confuses SELinux's genfscon lookup,
 	 * which matches on both fs_type->name AND s_magic. With a spoofed
-	 * magic the kernel finds no matching genfscon entry for "nomountfs"
+	 * magic the kernel finds no matching genfscon entry for "mirage"
 	 * and falls back to unlabeled — defeating any sepolicy rules.
 	 */
 	sb->s_magic = MIRAGE_FS_MAGIC;
@@ -535,6 +545,10 @@ static int mirage_setup_superblock(struct super_block *sb, struct mirage_sb_info
 		return err;
 	}
 	set_lower_paths(root, sbi->lower_paths, sbi->num_lower_paths);
+	
+	for (i = 0; i < sbi->num_lower_paths; i++) {
+		path_get(&sbi->lower_paths[i]);
+	}
 
 	/* Step B: The inode is instantiated to the dentry.
 	 * SELinux wakes up here, it will call our mirage_vfs_getxattr, and 
@@ -543,7 +557,6 @@ static int mirage_setup_superblock(struct super_block *sb, struct mirage_sb_info
 	d_instantiate(root, root_inode);
 
 	sb->s_root = root;
-	d_set_d_op(sb->s_root, &nomount_dops);
 
 	return 0;
 }
@@ -628,11 +641,8 @@ int mirage_fill_super(struct super_block *sb, void *raw_data, int silent)
 
 	mirage_setup_selinux(sb, sbi);
 
-	sbi->fake_type = kzalloc(sizeof(struct file_system_type), GFP_KERNEL);
-	if (sbi->fake_type) {
-		*sbi->fake_type = mirage_fs_type;
-		sbi->fake_type->name = sbi->lower_sb->s_type->name;
-		sb->s_type = sbi->fake_type;
+	if (sbi->lower_sb && sbi->lower_sb->s_type) {
+		sb->s_type = mirage_get_spoof_type(sbi->lower_sb->s_type->name);
 	}
 
 	if (sbi->lower_paths[sbi->num_lower_paths - 1].dentry == sbi->lower_sb->s_root) {
@@ -665,13 +675,11 @@ static void init_once(void *obj)
 int mirage_init_inode_cache(void)
 {
 	/* SLAB_HWCACHE_ALIGN: Aligns objects to the CPU's L1/L2 cache lines.
-	 * SLAB_MEM_SPREAD: Avoid concentrating memory on a single node.
 	 * This makes bulk inode allocations more fast.
 	 */
 	mirage_inode_cachep = kmem_cache_create("mirage_inode_cache",
 				                             sizeof(struct mirage_inode_info), 0,
-				                             SLAB_RECLAIM_ACCOUNT | SLAB_HWCACHE_ALIGN | SLAB_MEM_SPREAD,
-											 init_once);
+				                             SLAB_RECLAIM_ACCOUNT | SLAB_HWCACHE_ALIGN, init_once);
 	return mirage_inode_cachep ? 0 : -ENOMEM;
 }
 
@@ -682,7 +690,7 @@ void mirage_destroy_inode_cache(void)
 }
 
 /* --- NFS / Export Operations ---
- * These allow NoMountFS to handle file handles, 
+ * These allow Mirage to handle file handles, 
  * making it compatible with NFS and advanced tracing tools.
  */
 
@@ -697,7 +705,7 @@ static struct inode *mirage_nfs_get_inode(struct super_block *sb, u64 ino,
 	if (!lower_inode)
 		return ERR_PTR(-ESTALE);
 
-	/* Wrap it into a NoMountFS inode */
+	/* Wrap it into a Mirage inode */
 	return mirage_iget(sb, lower_inode);
 }
 

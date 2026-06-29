@@ -54,14 +54,15 @@ static void mirage_vfs_d_release(struct dentry *dentry)
 	free_dentry_private_data(dentry);
 }
 
-static struct dentry *mirage_vfs_d_real(struct dentry *dentry,
-					const struct inode *inode)
+static struct dentry *mirage_vfs_d_real(struct dentry *dentry, D_REAL_ARGS)
 {
 	struct dentry *lower_dentry;
 	struct mirage_dentry_info *info;
 
-	if (likely(inode && d_inode(dentry) == inode))
-		return dentry;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+    if (likely(inode && d_inode(dentry) == inode))
+        return dentry;
+#endif
 
 	info = rcu_access_pointer(dentry->d_fsdata);
 	if (unlikely(!info || !info->lower_paths[0].dentry))
@@ -70,7 +71,7 @@ static struct dentry *mirage_vfs_d_real(struct dentry *dentry,
 	lower_dentry = info->lower_paths[0].dentry;
 
 	if (lower_dentry->d_op && lower_dentry->d_op->d_real)
-		return lower_dentry->d_op->d_real(lower_dentry, inode);
+		return lower_dentry->d_op->d_real(lower_dentry, D_REAL_PASS);
 
 	return lower_dentry;
 }

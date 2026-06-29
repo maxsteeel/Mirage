@@ -32,7 +32,7 @@ static struct dentry *mirage_mount(struct file_system_type *fs_type,
 /* File system definition */
 struct file_system_type mirage_fs_type = {
 	.owner		= THIS_MODULE,
-	.name		= NOMOUNT_NAME, /* This will be "mirage" */
+	.name		  = MIRAGE_NAME, /* This will be "mirage" */
 	.mount		= mirage_mount,
 	.kill_sb	= generic_shutdown_super,
 	.fs_flags	= FS_RENAME_DOES_D_MOVE,
@@ -86,8 +86,10 @@ static int __init init_mirage_vfs(void)
 	pr_info("mirage: Successfully registered.\n");
 	return 0;
 
+#ifdef MIRAGE_KERNEL_UMOUNT
 out_unregister_fs:
 	unregister_filesystem(&mirage_fs_type);
+#endif
 out_free_file_cache:
 	mirage_destroy_file_cache();
 out_free_dentry_cache:
@@ -115,10 +117,10 @@ static void __exit exit_mirage_vfs(void)
 	mirage_exit_hooks();
 #endif
 
-	unregister_filesystem(&nomount_fs_type);
+	unregister_filesystem(&mirage_fs_type);
 	
 	/* Destroy caches only after VFS is unregistered and no one can use it */
-	mirage_destroy_dirent_cache();
+	mirage_destroy_file_cache();
 	mirage_destroy_dentry_cache();
 	mirage_destroy_inode_cache();
 

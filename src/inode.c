@@ -7,7 +7,7 @@
 #include "compat.h"
 #include <linux/xattr.h>
 
-static int mirage_vfs_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool want_excl)
+static int mirage_vfs_create(IDMAP_ARG, struct inode *dir, struct dentry *dentry, umode_t mode, bool want_excl)
 {
 	int err;
 	struct dentry *alias;
@@ -20,7 +20,7 @@ static int mirage_vfs_create(struct inode *dir, struct dentry *dentry, umode_t m
 
 	lower_parent_dentry = lock_parent(lower_dentry);
 
-	err = vfs_create(d_inode(lower_parent_dentry), lower_dentry, mode, want_excl);
+	err = vfs_create(MIRAGE_IDMAP(&lower_path), d_inode(lower_parent_dentry), lower_dentry, mode, want_excl);
 	if (err) goto out;
 
 	/* Interpose the new dentry - check for errors properly */
@@ -48,19 +48,19 @@ static int mirage_vfs_unlink(struct inode *dir, struct dentry *dentry)
 	int err;
 	struct inode *lower_dir_inode = mirage_lower_inode(dir);
 	struct dentry *lower_dir_dentry;
-	struct nomount_dentry_info *info = rcu_dereference_raw(dentry->d_fsdata);
+	struct mirage_dentry_info *info = rcu_dereference_raw(dentry->d_fsdata);
 
 	struct dentry *lower_dentry = info->lower_paths[0].dentry;
 
 	lower_dir_dentry = lock_parent(lower_dentry);
 
-	err = vfs_unlink(lower_dir_inode, lower_dentry, NULL);
+	err = vfs_unlink(MIRAGE_IDMAP(&info->lower_paths[0]), lower_dir_inode, lower_dentry, NULL);
 	if (err) goto out;
 
 	if (d_inode(dentry)) {
 		set_nlink(d_inode(dentry), mirage_lower_inode(d_inode(dentry))->i_nlink);
 		/* Sync deleted file ctime for apps holding open file descriptors */
-		fsstack_copy_attr_times(d_inode(dentry), nomount_lower_inode(d_inode(dentry)));
+		fsstack_copy_attr_times(d_inode(dentry), mirage_lower_inode(d_inode(dentry)));
 	}
 	d_drop(dentry);
 out:
@@ -68,7 +68,7 @@ out:
 	return err;
 }
 
-static int mirage_vfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+static int mirage_vfs_mkdir(IDMAP_ARG, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	int err;
 	struct dentry *alias;
@@ -80,7 +80,7 @@ static int mirage_vfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mo
 
 	lower_parent_dentry = lock_parent(lower_dentry);
 
-	err = vfs_mkdir(d_inode(lower_parent_dentry), lower_dentry, mode);
+	err = vfs_mkdir(MIRAGE_IDMAP(&lower_path), d_inode(lower_parent_dentry), lower_dentry, mode);
 	if (err) goto out;
 
 	alias = __mirage_interpose(dentry, dir->i_sb, &lower_path);
@@ -92,9 +92,9 @@ static int mirage_vfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mo
 	}
 	err = 0;
 
-	fsstack_copy_attr_times(dir, nomount_lower_inode(dir));
+	fsstack_copy_attr_times(dir, mirage_lower_inode(dir));
 	fsstack_copy_inode_size(dir, d_inode(lower_parent_dentry));
-	set_nlink(dir, nomount_lower_inode(dir)->i_nlink);
+	set_nlink(dir, mirage_lower_inode(dir)->i_nlink);
 
 out:
 	unlock_dir(lower_parent_dentry);
@@ -111,14 +111,14 @@ static int mirage_vfs_rmdir(struct inode *dir, struct dentry *dentry)
 
 	lower_dir_dentry = lock_parent(lower_dentry);
 
-	err = vfs_rmdir(d_inode(lower_dir_dentry), lower_dentry);
+	err = vfs_rmdir(MIRAGE_IDMAP(&info->lower_paths[0]), d_inode(lower_dir_dentry), lower_dentry);
 	if (err) goto out;
 
 	d_drop(dentry);
 	if (d_inode(dentry)) {
 		clear_nlink(d_inode(dentry));
 		/* Sync deleted directory ctime */
-		fsstack_copy_attr_times(d_inode(dentry), nomount_lower_inode(d_inode(dentry)));
+		fsstack_copy_attr_times(d_inode(dentry), mirage_lower_inode(d_inode(dentry)));
 	}
 	
 	fsstack_copy_attr_times(dir, d_inode(lower_dir_dentry));
@@ -130,7 +130,7 @@ out:
 	return err;
 }
 
-static int mirage_vfs_symlink(struct inode *dir, struct dentry *dentry, const char *symname)
+static int mirage_vfs_symlink(IDMAP_ARG, struct inode *dir, struct dentry *dentry, const char *symname)
 {
 	int err;
 	struct dentry *alias;
@@ -142,7 +142,7 @@ static int mirage_vfs_symlink(struct inode *dir, struct dentry *dentry, const ch
 
 	lower_parent_dentry = lock_parent(lower_dentry);
 
-	err = vfs_symlink(d_inode(lower_parent_dentry), lower_dentry, symname);
+	err = vfs_symlink(MIRAGE_IDMAP(&lower_path), d_inode(lower_parent_dentry), lower_dentry, symname);
 	if (err) goto out;
 
 	alias = __mirage_interpose(dentry, dir->i_sb, &lower_path);
@@ -154,7 +154,7 @@ static int mirage_vfs_symlink(struct inode *dir, struct dentry *dentry, const ch
 	}
 	err = 0;
 
-	fsstack_copy_attr_times(dir, nomount_lower_inode(dir));
+	fsstack_copy_attr_times(dir, mirage_lower_inode(dir));
 	fsstack_copy_inode_size(dir, d_inode(lower_parent_dentry));
 
 out:
@@ -163,11 +163,11 @@ out:
 }
 
 #ifdef RENAME_HAS_FLAGS
-static int mirage_vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+static int mirage_vfs_rename(IDMAP_ARG, struct inode *old_dir, struct dentry *old_dentry,
 			  struct inode *new_dir, struct dentry *new_dentry,
 			  unsigned int flags)
 #else
-static int mirage_vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+static int mirage_vfs_rename(IDMAP_ARG, struct inode *old_dir, struct dentry *old_dentry,
 			  struct inode *new_dir, struct dentry *new_dentry)
 #endif
 {
@@ -200,9 +200,25 @@ static int mirage_vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	if (trap == lower_new_dentry) { err = -ENOTEMPTY; goto out; }
 
 #ifdef RENAME_HAS_FLAGS
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    struct renamedata rd = {
+        .old_mnt_idmap = MIRAGE_IDMAP(&old_info->lower_paths[0]),
+        .old_dir       = d_inode(lower_old_dir_dentry),
+        .old_dentry    = lower_old_dentry,
+        .new_mnt_idmap = MIRAGE_IDMAP(&new_info->lower_paths[0]),
+        .new_dir       = d_inode(lower_new_dir_dentry),
+        .new_dentry    = lower_new_dentry,
+        .delegated_inode = NULL,
+        .flags         = flags,
+    };
+    err = vfs_rename(&rd);
+#else
 	/* Pass the flags down to the physical filesystem layer */
 	err = vfs_rename(d_inode(lower_old_dir_dentry), lower_old_dentry,
 			 d_inode(lower_new_dir_dentry), lower_new_dentry, NULL, flags);
+#endif
+
 #else
 	err = vfs_rename(d_inode(lower_old_dir_dentry), lower_old_dentry,
 			 d_inode(lower_new_dir_dentry), lower_new_dentry);
@@ -231,40 +247,25 @@ out:
 	return err;
 }
 
-static int mirage_vfs_getattr(const struct path *path, struct kstat *stat,
+static int mirage_vfs_getattr(IDMAP_ARG, const struct path *path, struct kstat *stat,
 			   u32 request_mask, unsigned int query_flags)
 {
-	struct mirage_dentry_info *info;
-	struct path lower_path;
-	int err = -ENOENT;
+	struct inode *inode = d_inode(path->dentry);
+	struct inode *lower_inode = mirage_lower_inode(inode);
 
-	/* We extract the active path */
-	info = rcu_access_pointer(path->dentry->d_fsdata);
-	
-	if (likely(info && info->lower_paths[0].dentry)) {
-		lower_path = info->lower_paths[0];
-		err = vfs_getattr(&lower_path, stat, request_mask, query_flags);
-		
-		/*
-		 * We MUST sync the stat->dev with our virtual superblock's s_dev.
-		 * If super.c assigned an anonymous block (0:XX) or a real physical 
-		 * block (259:1), getattr must mirror it perfectly. 
-		 * Otherwise, userspace apps reading /proc/self/mountinfo will detect 
-		 * a mismatch against stat().
-		 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	generic_fillattr(IDMAP_CALL, request_mask, lower_inode, stat);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	generic_fillattr(IDMAP_CALL, lower_inode, stat);
+#else
+	generic_fillattr(lower_inode, stat);
+#endif
 
-		if (likely(!err)) {
-			stat->dev = path->dentry->d_sb->s_dev;
-		}
-	} else {
-		generic_fillattr(d_inode(path->dentry), stat);
-		err = 0;
-	}
-	
-	return err;
+	stat->dev = inode->i_sb->s_dev;
+	return 0;
 }
 
-static int mirage_vfs_setattr(struct dentry *dentry, struct iattr *ia)
+static int mirage_vfs_setattr(IDMAP_ARG, struct dentry *dentry, struct iattr *ia)
 {
 	int err;
 	struct inode *inode = d_inode(dentry);
@@ -272,10 +273,12 @@ static int mirage_vfs_setattr(struct dentry *dentry, struct iattr *ia)
 	struct mirage_dentry_info *info = rcu_dereference_raw(dentry->d_fsdata);
 	struct dentry *lower_dentry = info->lower_paths[0].dentry;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-	err = setattr_prepare(&init_user_ns, dentry, ia);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    err = setattr_prepare(IDMAP_CALL, dentry, ia);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    err = setattr_prepare(&init_user_ns, dentry, ia);
 #else
-	err = setattr_prepare(dentry, ia);
+    err = setattr_prepare(dentry, ia);
 #endif
 	if (err) return err;
 
@@ -289,7 +292,7 @@ static int mirage_vfs_setattr(struct dentry *dentry, struct iattr *ia)
 		}
 	}
 
-	err = notify_change(lower_dentry, ia, NULL);
+	err = notify_change(MIRAGE_IDMAP(&info->lower_paths[0]), lower_dentry, ia, NULL);
 	inode_unlock(lower_inode);
 
 	if (!err) {
@@ -321,7 +324,7 @@ static ssize_t mirage_vfs_getxattr(struct dentry *dentry, struct inode *inode,
 		/* First check if the physical inode supports XATTRs using its native flag.
 		 * Then delegate the public call directly to the physical system. */
 		if (d_inode(ld)->i_opflags & IOP_XATTR) {
-			err = vfs_getxattr(ld, name, buffer, size);
+			err = vfs_getxattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name, buffer, size);
 		}
 	}
 
@@ -343,7 +346,7 @@ static int mirage_vfs_setxattr(struct dentry *dentry, struct inode *inode, const
 	ld = info->lower_paths[0].dentry;
 
 	if (likely(d_inode(ld)->i_opflags & IOP_XATTR)) {
-		err = vfs_setxattr(ld, name, value, size, flags);
+		err = vfs_setxattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name, value, size, flags);
 		if (!err) 
 			fsstack_copy_attr_all(inode, d_inode(ld));
 	}
@@ -364,7 +367,7 @@ static int mirage_vfs_removexattr(struct dentry *dentry, struct inode *inode, co
 	ld = info->lower_paths[0].dentry;
 
 	if (likely(d_inode(ld)->i_opflags & IOP_XATTR)) {
-		err = vfs_removexattr(ld, name);
+		err = vfs_removexattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name);
 		if (!err) 
 			fsstack_copy_attr_all(inode, d_inode(ld));
 	}
@@ -395,13 +398,13 @@ static ssize_t mirage_vfs_listxattr(struct dentry *dentry, char *buffer, size_t 
 /* --- Handlers XATTRs --- */
 static int mirage_xattr_get(const struct xattr_handler *handler,
 			    struct dentry *dentry, struct inode *inode,
-			    const char *name, void *buffer, size_t size, int flags)
+			    const char *name, void *buffer, size_t size)
 {
 	return mirage_vfs_getxattr(dentry, inode, name, buffer, size);
 }
 
 static int mirage_xattr_set(const struct xattr_handler *handler,
-			    struct dentry *dentry, struct inode *inode,
+			    IDMAP_ARG, struct dentry *dentry, struct inode *inode,
 			    const char *name, const void *value, size_t size,
 			    int flags)
 {
@@ -457,14 +460,13 @@ static const char *mirage_vfs_get_link(struct dentry *dentry,
 }
 #endif
 
-static int mirage_permission(struct inode *inode, int mask)
+static int mirage_permission(IDMAP_ARG, struct inode *inode, int mask)
 {
-	/* * inode_permission() natively handles MAY_NOT_BLOCK (RCU mode) correctly
-	 * AND invokes the SELinux MAC hooks (security_inode_permission).
-	 * Calling generic_permission() manually bypasses SELinux and breaks
-	 * compilation on 5.12+ kernels.
-	 */
-	return inode_permission(mirage_lower_inode(inode), mask);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	return inode_permission(&nop_mnt_idmap, mirage_lower_inode(inode), mask);
+#else
+	return inode_permission(IDMAP_CALL, mirage_lower_inode(inode), mask);
+#endif
 }
 
 /* --- Operation Vectors --- */
@@ -478,14 +480,14 @@ const struct inode_operations mirage_dir_iops = {
 	.rmdir		= mirage_vfs_rmdir,
 	.symlink    = mirage_vfs_symlink,
 	.rename		= mirage_vfs_rename,
-	.permission	= mirage_vfs_permission,
+	.permission	= mirage_permission,
 	.setattr    = mirage_vfs_setattr,
 	.listxattr	= mirage_vfs_listxattr,
 };
 
 const struct inode_operations mirage_main_iops = {
 	.getattr    = mirage_vfs_getattr,
-	.permission	= mirage_vfs_permission,
+	.permission	= mirage_permission,
 	.setattr    = mirage_vfs_setattr,
 	.listxattr	= mirage_vfs_listxattr,
 };
@@ -497,7 +499,7 @@ const struct inode_operations mirage_symlink_iops = {
 #else
 	.get_link	 = mirage_vfs_get_link,
 #endif
-	.permission	 = mirage_vfs_permission,
+	.permission	 = mirage_permission,
 	.setattr     = mirage_vfs_setattr,
 	.listxattr	 = mirage_vfs_listxattr,
 };

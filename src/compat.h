@@ -86,6 +86,44 @@
     #define RENAME_HAS_FLAGS
 #endif
 
+/* ID Map handling for Modern Kernels (6.3+) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    #define XATTR_HANDLER_ARGS const struct xattr_handler *handler, struct mnt_idmap *idmap, struct dentry *dentry, struct inode *inode, const char *name
+    #define MIRAGE_IDMAP(path) mnt_idmap((path)->mnt)
+    #define IDMAP_ARG struct mnt_idmap *idmap
+    #define IDMAP_CALL idmap
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    #define XATTR_HANDLER_ARGS const struct xattr_handler *handler, struct user_namespace *mnt_userns, struct dentry *dentry, struct inode *inode, const char *name
+    #define MIRAGE_IDMAP(path) mnt_user_ns((path)->mnt)
+    #define IDMAP_ARG struct user_namespace *mnt_userns
+    #define IDMAP_CALL mnt_userns
+#else
+    #define XATTR_HANDLER_ARGS const struct xattr_handler *handler, struct dentry *dentry, struct inode *inode, const char *name
+    #define MIRAGE_IDMAP(path) /* Nothing */
+    #define IDMAP_ARG /* Nothing */
+    #define IDMAP_CALL /* Nothing */
+#endif
+
+/* d_real signature changed in Kernel 6.5 from passing an inode to passing a type enum */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+    #define D_REAL_ARGS enum d_real_type type
+    #define D_REAL_PASS type
+#else
+    #define D_REAL_ARGS const struct inode *inode
+    #define D_REAL_PASS inode
+#endif
+
+/*
+ * String copying safe fallback.
+ * strscpy was introduced in 4.3. Older kernels must use strlcpy.
+ * Modern kernels (6.8+) removed strlcpy entirely.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
+    #ifndef strscpy
+        #define strscpy strlcpy
+    #endif
+#endif
+
 /* Compatibility for i_version in Kernel 5.4+ */
 static inline void mirage_set_iversion(struct inode *inode, u64 val)
 {

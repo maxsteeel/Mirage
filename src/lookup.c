@@ -38,7 +38,7 @@ struct inode *mirage_iget(struct super_block *sb, struct inode *lower_inode)
 		return ERR_PTR(-ESTALE);
 
 	/* Use hash lookup to find if we already have a virtual inode for this real one.
-	 * iget5_locked will call nomount_inode_set internally if it is a new inode */
+	 * iget5_locked will call inode_set internally if it is a new inode */
 	inode = iget5_locked(sb, lower_inode->i_ino,
 			     mirage_inode_test, mirage_inode_set, lower_inode);
 
@@ -69,7 +69,7 @@ struct inode *mirage_iget(struct super_block *sb, struct inode *lower_inode)
 		inode->i_fop = &mirage_main_fops;
 	}
 
-	inode->i_mapping->a_ops = &nomount_aops;
+	inode->i_mapping->a_ops = &mirage_aops;
 
 	/* Properly initialize special devices (char, block, fifo) */
 	if (unlikely(S_ISBLK(lower_inode->i_mode) || S_ISCHR(lower_inode->i_mode) ||
@@ -123,7 +123,7 @@ struct dentry *mirage_vfs_lookup(struct inode *dir, struct dentry *dentry,
 {
 	struct dentry *ret, *lower_dentry;
 	struct mirage_dentry_info *parent_info;
-	struct path found_paths[NOMOUNT_MAX_BRANCHES];
+	struct path found_paths[MIRAGE_MAX_BRANCHES];
 	int num_found_paths = 0;
 	struct mirage_sb_info *sbi;
 	struct qstr name = dentry->d_name;
@@ -175,7 +175,7 @@ struct dentry *mirage_vfs_lookup(struct inode *dir, struct dentry *dentry,
 			lower_path.dentry = lower_dentry;
 			/* We still mntget because follow_down modifies the mount reference */
 			lower_path.mnt = mntget(parent_info->lower_paths[i].mnt);
-			err = follow_down(&lower_path);
+			err = follow_down(&lower_path, flags);
 			if (err < 0) {
 				/* follow_down failed — clean up and continue to next layer
 				 * path_put releases BOTH mnt and dentry */

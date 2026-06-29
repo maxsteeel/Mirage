@@ -13,7 +13,7 @@ int mirage_init_file_cache(void)
 {
     mirage_file_cachep = kmem_cache_create("mirage_file_cache",
                                            sizeof(struct mirage_file_info), 0,
-                                           SLAB_RECLAIM_ACCOUNT | SLAB_HWCACHE_ALIGN | SLAB_MEM_SPREAD, NULL);
+                                           SLAB_RECLAIM_ACCOUNT | SLAB_HWCACHE_ALIGN, NULL);
     return mirage_file_cachep ? 0 : -ENOMEM;
 }
 
@@ -39,8 +39,7 @@ static int mirage_vfs_open(struct inode *inode, struct file *file)
 	info = kmem_cache_alloc(mirage_file_cachep, GFP_KERNEL);
 	if (unlikely(!info))
 		return -ENOMEM;
- 
-	info->ghost_emitted = false;
+
 	info->num_lower_files = 0;
 
 	if (!S_ISDIR(inode->i_mode)) {
@@ -71,7 +70,7 @@ static int mirage_vfs_open(struct inode *inode, struct file *file)
 	}
 
 	if (err && info->num_lower_files == 0) {
-		kmem_cache_free(mirage_dirent_cachep, info);
+		kmem_cache_free(mirage_file_cachep, info);
 		return err;
 	} else if (err) {
 		/* Failed partway through opening directories; close what we opened */
@@ -86,7 +85,7 @@ static int mirage_vfs_open(struct inode *inode, struct file *file)
 		return -ENOENT;
 	} else {
 		file->private_data = info;
-		fsstack_copy_attr_all(inode, mirage_vfs_lower_inode(inode));
+		fsstack_copy_attr_all(inode, mirage_lower_inode(inode));
 	}
 	return 0;
 }
@@ -115,7 +114,7 @@ static int mirage_vfs_release(struct inode *inode, struct file *file)
  */
 static long mirage_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	struct file *lower_file = mirage_vfs_lower_file(file);
+	struct file *lower_file = mirage_lower_file(file);
 	long err = -ENOTTY;
 
 	if (lower_file->f_op && lower_file->f_op->unlocked_ioctl)
@@ -131,7 +130,7 @@ static long mirage_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned 
 static long mirage_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	long err = -ENOTTY;
-	struct file *lower_file = mirage_vfs_lower_file(file);
+	struct file *lower_file = mirage_lower_file(file);
 
 	/* Redirect the call to the lower filesystem's compat_ioctl */
 	if (lower_file->f_op && lower_file->f_op->compat_ioctl)
@@ -143,7 +142,7 @@ static long mirage_compat_ioctl(struct file *file, unsigned int cmd, unsigned lo
 
 static int mirage_vfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
-	struct file *lower_file = mirage_vfs_lower_file(file);
+	struct file *lower_file = mirage_lower_file(file);
 	int err;
 
 	err = __generic_file_fsync(file, start, end, datasync);
@@ -154,7 +153,7 @@ static int mirage_vfs_fsync(struct file *file, loff_t start, loff_t end, int dat
 
 static int mirage_vfs_flush(struct file *file, fl_owner_t id)
 {
-	struct file *lower_file = mirage_vfs_lower_file(file);
+	struct file *lower_file = mirage_lower_file(file);
 	if (lower_file && lower_file->f_op && lower_file->f_op->flush)
 		return lower_file->f_op->flush(lower_file, id);
 	return 0;
@@ -162,7 +161,7 @@ static int mirage_vfs_flush(struct file *file, fl_owner_t id)
 
 static int mirage_vfs_fasync(int fd, struct file *file, int flag)
 {
-	struct file *lower_file = mirage_vfs_lower_file(file);
+	struct file *lower_file = mirage_lower_file(file);
 	if (lower_file->f_op && lower_file->f_op->fasync)
 		return lower_file->f_op->fasync(fd, lower_file, flag);
 	return 0;
@@ -179,14 +178,14 @@ static ssize_t mirage_vfs_read(struct file *file, char __user *buf,
 	 * Updating metadata on every read chunk thrashes the CPU cache.
 	 * getattr() will fetch the correct times directly from disk when requested.
 	 */
-	return vfs_read(mirage_vfs_lower_file(file), buf, count, ppos);
+	return vfs_read(mirage_lower_file(file), buf, count, ppos);
 }
 
 static ssize_t mirage_vfs_write(struct file *file, const char __user *buf,
 			     size_t count, loff_t *ppos)
 {
 	/* Forward write to the lower filesystem */
-	return vfs_write(mirage_vfs_lower_file(file), buf, count, ppos);
+	return vfs_write(mirage_lower_file(file), buf, count, ppos);
 }
 #else
 /* * mirage_vfs_read_iter: modern read interface.
@@ -218,7 +217,7 @@ static ssize_t mirage_vfs_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
 	ssize_t err;
 	struct file *file = iocb->ki_filp;
-	struct file *lower_file = mirage_vfs_lower_file(file);
+	struct file *lower_file = mirage_lower_file(file);
 	struct file *saved_filp;
 
 	if (unlikely(!lower_file->f_op->write_iter))
@@ -307,7 +306,7 @@ int mirage_vfs_iterate(struct file *file, struct dir_context *ctx)
     struct mirage_sb_info *sbi = mirage_sb(file->f_inode->i_sb);
     struct mirage_file_info *mfi = mirage_file(file);
     bool is_root = (file->f_path.dentry == file->f_inode->i_sb->s_root);
-    loff_t nomount_magic_pos = 0x7000000000000000ULL;
+    loff_t magic_pos = 0x7000000000000000ULL;
     int i, err = 0;
 
     /* Allocate the proxy context directly inside the CPU stack */
@@ -322,7 +321,7 @@ int mirage_vfs_iterate(struct file *file, struct dir_context *ctx)
     };
 
     /* Phase 1: Stream and merge entries from all active filesystem layers */
-    if (ctx->pos < nomount_magic_pos) {
+    if (ctx->pos < magic_pos) {
         for (i = 0; i < mfi->num_lower_files; i++) {
             struct file *lower_file = mfi->lower_files[i];
 
@@ -344,11 +343,11 @@ int mirage_vfs_iterate(struct file *file, struct dir_context *ctx)
 
     /* Phase 2: Synthetic ghost file append (Only if it wasn't shadowed) */
     if (err >= 0 && is_root && sbi->has_inject) {
-        if (!proxy_ctx.ghost_found && ctx->pos <= nomount_magic_pos) {
+        if (!proxy_ctx.ghost_found && ctx->pos <= magic_pos) {
             u64 fake_ino = d_inode(sbi->inject_path.dentry)->i_ino;
-            ctx->pos = nomount_magic_pos;
+            ctx->pos = magic_pos;
             if (dir_emit(ctx, sbi->inject_name, sbi->inject_name_len, fake_ino, DT_REG)) {
-                ctx->pos = nomount_magic_pos + 1;
+                ctx->pos = magic_pos + 1;
             }
         }
     }
@@ -363,9 +362,9 @@ int mirage_vfs_readdir(struct file *file, void *dirent, filldir_t filldir)
 {
 	/* Too complex to cleanly support unioning on legacy without custom state tracking.
      * We fallback to single layer for ancient kernels */
-    struct file *lower_file = mirage_vfs_lower_file(file);
-    struct nomount_sb_info *sbi = mirage_sb(file->f_inode->i_sb);
-    struct nomount_file_info *mfi = mirage_file(file);
+    struct file *lower_file = mirage_lower_file(file);
+    struct mirage_sb_info *sbi = mirage_sb(file->f_inode->i_sb);
+    struct mirage_file_info *mfi = mirage_file(file);
     int err;
 
     if (!lower_file->f_op->readdir)
