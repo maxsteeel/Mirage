@@ -6,20 +6,16 @@
 #ifndef _MIRAGE_COMPAT_H_
 #define _MIRAGE_COMPAT_H_
 
-#include <linux/version.h>
-#include <linux/fs.h>
-#include <linux/sched.h>
-#include <linux/path.h>
-#include <linux/syscalls.h>
-#include <linux/mount.h>
-
 #ifndef TWA_RESUME
 #define TWA_RESUME true
 #endif
 
-/* iversion.h was introduced in kernel 4.16; use raw i_version on older kernels */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-#include <linux/iversion.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+    #define MIR_ACTOR_RET bool
+    #define MIR_ACTOR_CONTINUE true
+#else
+    #define MIR_ACTOR_RET int
+    #define MIR_ACTOR_CONTINUE 0
 #endif
 
 /*
@@ -61,16 +57,6 @@
 #endif
 
 /*
- * User ID management.
- * Handling the transition to kuid_t for very old kernels.
- */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 5, 0)
-    #define current_uid_val() (current_fsuid())
-#else
-    #define current_uid_val() (from_kuid(&init_user_ns, current_fsuid()))
-#endif
-
-/*
  * File I/O: read_iter (new) vs aio_read/read (old).
  * read_iter was standardized around 3.16/3.19.
  */
@@ -88,17 +74,14 @@
 
 /* ID Map handling for Modern Kernels (6.3+) */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-    #define XATTR_HANDLER_ARGS const struct xattr_handler *handler, struct mnt_idmap *idmap, struct dentry *dentry, struct inode *inode, const char *name
     #define MIRAGE_IDMAP(path) mnt_idmap((path)->mnt)
     #define IDMAP_ARG struct mnt_idmap *idmap
     #define IDMAP_CALL idmap
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-    #define XATTR_HANDLER_ARGS const struct xattr_handler *handler, struct user_namespace *mnt_userns, struct dentry *dentry, struct inode *inode, const char *name
     #define MIRAGE_IDMAP(path) mnt_user_ns((path)->mnt)
     #define IDMAP_ARG struct user_namespace *mnt_userns
     #define IDMAP_CALL mnt_userns
 #else
-    #define XATTR_HANDLER_ARGS const struct xattr_handler *handler, struct dentry *dentry, struct inode *inode, const char *name
     #define MIRAGE_IDMAP(path) /* Nothing */
     #define IDMAP_ARG /* Nothing */
     #define IDMAP_CALL /* Nothing */
@@ -122,32 +105,6 @@
     #ifndef strscpy
         #define strscpy strlcpy
     #endif
-#endif
-
-/* Compatibility for i_version in Kernel 5.4+ */
-static inline void mirage_set_iversion(struct inode *inode, u64 val)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-	inode_set_iversion(inode, val);
-#else
-	inode->i_version = val;
-#endif
-}
-
-static inline void mirage_inc_iversion(struct inode *inode)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-	inode_inc_iversion(inode);
-#else
-	inode->i_version++;
-#endif
-}
-
-/* Lookup flags: 'unsigned int' in new kernels, 'int' in old ones. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
-    typedef unsigned int mirage_lookup_flags;
-#else
-    typedef int mirage_lookup_flags;
 #endif
 
 /*
@@ -179,73 +136,14 @@ static inline void mirage_inc_iversion(struct inode *inode)
  *
  * Returns ERR_PTR on error, never NULL.
  */
+static inline struct vfsmount *mirage_clone_private_mount(struct path *path)
+{
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0) && !defined(NO_CLONE_PRIVATE_MOUNT)
-
-static inline struct vfsmount *mirage_clone_private_mount(struct path *path)
-{
 	struct vfsmount *mnt = clone_private_mount(path);
-	return mnt ? mnt : ERR_PTR(-ENOMEM);
-}
-
 #else
-static inline struct vfsmount *mirage_clone_private_mount(struct path *path)
-{
 	struct vfsmount *mnt = mntget(path->mnt);
+#endif
 	return mnt ? mnt : ERR_PTR(-ENOMEM);
-}
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0) && defined(MIRAGE_KERNEL_UMOUNT)
-__weak int path_umount(struct path *path, int flags)
-{
-	char buf[256] = {0};
-	int ret;
-
-	// -1 on the size as implicit null termination
-	// as we zero init the thing
-	char *usermnt = d_path(path, buf, sizeof(buf) - 1);
-	if (!(usermnt && usermnt != buf)) {
-		ret = -ENOENT;
-		goto out;
-	}
-
-	mm_segment_t old_fs = get_fs();
-	set_fs(KERNEL_DS);
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
-	ret = ksys_umount((char __user *)usermnt, flags);
-#else
-	ret = (int)sys_umount((char __user *)usermnt, flags);
-#endif
-
-	set_fs(old_fs);
-
-	// release ref here! user_path_at increases it
-	// then only cleans for itself
-out:
-	path_put(path); 
-	return ret;
-}
-#endif
-
-static inline u64 mirage_query_iversion(struct inode *inode)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-	return inode_query_iversion(inode);
-#else
-	return inode->i_version;
-#endif
-}
-
-/* Helper to get mtime from inode, handling both old and new kernels */
-static inline u64 mirage_get_mtime(struct inode *inode)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-    struct timespec64 mtime = inode_get_mtime(inode);
-    return mtime.tv_sec;
-#else
-    return inode->i_mtime.tv_sec;
-#endif
 }
 
 #endif /* _MIRAGE_COMPAT_H_ */

@@ -3,25 +3,7 @@
  * Handling read, write and open.
  */
 
-#include "mirage.h"
-#include "compat.h"
-#include <linux/uio.h>
-
 struct kmem_cache *mirage_file_cachep;
-
-int mirage_init_file_cache(void)
-{
-    mirage_file_cachep = kmem_cache_create("mirage_file_cache",
-                                           sizeof(struct mirage_file_info), 0,
-                                           SLAB_RECLAIM_ACCOUNT | SLAB_HWCACHE_ALIGN, NULL);
-    return mirage_file_cachep ? 0 : -ENOMEM;
-}
-
-void mirage_destroy_file_cache(void)
-{
-    if (mirage_file_cachep)
-        kmem_cache_destroy(mirage_file_cachep);
-}
 
 /* * mirage_vfs_open: called when a file is being opened.
  * We must open the lower file and store its reference.
@@ -85,7 +67,6 @@ static int mirage_vfs_open(struct inode *inode, struct file *file)
 		return -ENOENT;
 	} else {
 		file->private_data = info;
-		fsstack_copy_attr_all(inode, mirage_lower_inode(inode));
 	}
 	return 0;
 }
@@ -108,6 +89,32 @@ static int mirage_vfs_release(struct inode *inode, struct file *file)
 		file->private_data = NULL;
 	}
 	return 0;
+}
+
+/*
+ * mirage_vfs_mmap: Delegate memory mapping directly to the physical disk.
+ *
+ * Instead of intercepting page faults (which requires dangerous VMA 
+ * cloning/memcpy and breaks on modern kernels), we completely hand over 
+ * the VMA ownership to the physical underlying file. 
+ */
+static int mirage_vfs_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct file *lower_file = mirage_lower_file(file);
+
+	if (!lower_file->f_op->mmap)
+		return -ENODEV;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+	vma_set_file(vma, lower_file);
+#else
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	vma->vm_file = get_file(lower_file);
+#endif
+
+	/* Call the lower filesystem's mmap natively */
+	return lower_file->f_op->mmap(lower_file, vma);
 }
 
 /* * IOCTL: Critical for hardware-specific storage commands in Android.
@@ -142,13 +149,7 @@ static long mirage_compat_ioctl(struct file *file, unsigned int cmd, unsigned lo
 
 static int mirage_vfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
-	struct file *lower_file = mirage_lower_file(file);
-	int err;
-
-	err = __generic_file_fsync(file, start, end, datasync);
-	if (err) return err;
-
-	return vfs_fsync_range(lower_file, start, end, datasync);
+	return vfs_fsync_range(mirage_lower_file(file), start, end, datasync);
 }
 
 static int mirage_vfs_flush(struct file *file, fl_owner_t id)
@@ -170,19 +171,12 @@ static int mirage_vfs_fasync(int fd, struct file *file, int flag)
 #ifdef HAVE_LEGACY_IO
 /* * mirage_vfs_read: The old read for Kernel < 3.16.
  */
-static ssize_t mirage_vfs_read(struct file *file, char __user *buf,
-			    size_t count, loff_t *ppos)
+static ssize_t mirage_vfs_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
-	/* * Forward read to the lower filesystem.
-	 * We intentionally omit fsstack_copy_attr_atime.
-	 * Updating metadata on every read chunk thrashes the CPU cache.
-	 * getattr() will fetch the correct times directly from disk when requested.
-	 */
 	return vfs_read(mirage_lower_file(file), buf, count, ppos);
 }
 
-static ssize_t mirage_vfs_write(struct file *file, const char __user *buf,
-			     size_t count, loff_t *ppos)
+static ssize_t mirage_vfs_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
 	/* Forward write to the lower filesystem */
 	return vfs_write(mirage_lower_file(file), buf, count, ppos);
@@ -239,14 +233,6 @@ static ssize_t mirage_vfs_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 }
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-    #define MIR_ACTOR_RET bool
-    #define MIR_ACTOR_CONTINUE true
-#else
-    #define MIR_ACTOR_RET int
-    #define MIR_ACTOR_CONTINUE 0
-#endif
-
 /* Embedded context proxy to bypass memory footprint during readdir */
 struct mirage_proxy_ctx {
     struct dir_context ctx;          /* Fake context passed to lower layers */
@@ -301,7 +287,7 @@ static MIR_ACTOR_RET mirage_proxy_actor(struct dir_context *ctx, const char *nam
 }
 
 #if defined(HAVE_ITERATE_SHARED) || defined(HAVE_ITERATE)
-int mirage_vfs_iterate(struct file *file, struct dir_context *ctx)
+static int mirage_vfs_iterate(struct file *file, struct dir_context *ctx)
 {
     struct mirage_sb_info *sbi = mirage_sb(file->f_inode->i_sb);
     struct mirage_file_info *mfi = mirage_file(file);
@@ -358,36 +344,32 @@ int mirage_vfs_iterate(struct file *file, struct dir_context *ctx)
 #else
 /* * Ultra-Legacy kernels ( < 3.11) use the old readdir.
  */
-int mirage_vfs_readdir(struct file *file, void *dirent, filldir_t filldir)
+static int mirage_vfs_readdir(struct file *file, void *dirent, filldir_t filldir)
 {
-	/* Too complex to cleanly support unioning on legacy without custom state tracking.
-     * We fallback to single layer for ancient kernels */
-    struct file *lower_file = mirage_lower_file(file);
-    struct mirage_sb_info *sbi = mirage_sb(file->f_inode->i_sb);
-    struct mirage_file_info *mfi = mirage_file(file);
-    int err;
+		struct file *lower_file = mirage_lower_file(file);
+		struct mirage_sb_info *sbi = mirage_sb(file->f_inode->i_sb);
+		loff_t magic_pos = 0x7000000000000000ULL;
+		int err;
 
-    if (!lower_file->f_op->readdir)
-        return -ENOTDIR;
+		if (!lower_file->f_op->readdir)
+				return -ENOTDIR;
 
-    /* For legacy, we do a simple pass-through first */
-    err = lower_file->f_op->readdir(lower_file, dirent, filldir);
-    file->f_pos = lower_file->f_pos;
+		if (file->f_pos < magic_pos) {
+				err = lower_file->f_op->readdir(lower_file, dirent, filldir);
+				file->f_pos = lower_file->f_pos;
+		} else {
+				err = 0;
+		}
 
-    /* If it's the root and we haven't emitted the ghost, do it now */
-    if (err >= 0 && (file->f_path.dentry == file->f_inode->i_sb->s_root) &&
-        sbi->has_inject && !mfi->ghost_emitted) {
-        
-        u64 fake_ino = d_inode(sbi->inject_path.dentry)->i_ino;
-        
-        /* Call the legacy filldir callback manually */
-        if (filldir(dirent, sbi->inject_name, sbi->inject_name_len, 
-                    file->f_pos, fake_ino, DT_REG) >= 0) {
-            mfi->ghost_emitted = true;
-            file->f_pos++;
-        }
-    }
-    return err;
+		if (err >= 0 && (file->f_path.dentry == file->f_inode->i_sb->s_root) &&
+				 sbi->has_inject && file->f_pos <= magic_pos) {
+
+				u64 fake_ino = d_inode(sbi->inject_path.dentry)->i_ino;
+				file->f_pos = magic_pos;
+				if (filldir(dirent, sbi->inject_name, sbi->inject_name_len, file->f_pos, fake_ino, DT_REG) >= 0)
+						file->f_pos = magic_pos + 1;
+		}
+		return err;
 }
 #endif
 
@@ -432,4 +414,18 @@ const struct file_operations mirage_dir_fops = {
 	.readdir	    = mirage_vfs_readdir,
 #endif
 };
+
+static int mirage_init_file_cache(void)
+{
+    mirage_file_cachep = kmem_cache_create("mirage_file_cache",
+                                           sizeof(struct mirage_file_info), 0,
+                                           SLAB_RECLAIM_ACCOUNT | SLAB_HWCACHE_ALIGN, NULL);
+    return mirage_file_cachep ? 0 : -ENOMEM;
+}
+
+static void mirage_destroy_file_cache(void)
+{
+    if (mirage_file_cachep)
+        kmem_cache_destroy(mirage_file_cachep);
+}
 

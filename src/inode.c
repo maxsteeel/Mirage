@@ -3,43 +3,66 @@
  * Full R/W support with xattr (SELinux), rename, symlink and legacy compatibility.
  */
 
-#include "mirage.h"
-#include "compat.h"
-#include <linux/xattr.h>
-
 static int mirage_vfs_create(IDMAP_ARG, struct inode *dir, struct dentry *dentry, umode_t mode, bool want_excl)
 {
 	int err;
-	struct dentry *alias;
-	struct dentry *lower_parent_dentry = NULL;
-	struct mirage_dentry_info *info = rcu_dereference_raw(dentry->d_fsdata);
-
-    /* VFS holds parent i_mutex, so for that extract raw path is secure on this context. */
-	struct path lower_path = info->lower_paths[0]; 
-	struct dentry *lower_dentry = lower_path.dentry;
-
-	lower_parent_dentry = lock_parent(lower_dentry);
-
-	err = vfs_create(MIRAGE_IDMAP(&lower_path), d_inode(lower_parent_dentry), lower_dentry, mode, want_excl);
-	if (err) goto out;
-
-	/* Interpose the new dentry - check for errors properly */
-	alias = __mirage_interpose(dentry, dir->i_sb, &lower_path);
-	if (IS_ERR(alias)) {
-		err = PTR_ERR(alias);
-		goto out;
-	} else if (alias && alias != dentry) {
-		/* If d_splice_alias returns a valid hashed alias from the cache,
-		 * we must drop the extra reference. */
-		dput(alias);
+	struct dentry *lower_dentry, *lower_parent_dentry;
+	struct dentry *parent_dentry = dget_parent(dentry);
+	struct mirage_dentry_info *parent_info = mirage_dentry(parent_dentry);
+	struct mirage_dentry_info *info;
+	struct inode *new_inode;
+	struct path lower_path;
+	
+	/* 1. Extract parent information safely */
+	if (!parent_info || !parent_info->lower_paths[0].dentry) {
+		dput(parent_dentry);
+		return -EINVAL;
 	}
+
+	/* 2. Lock the physical parent directory */
+	lower_parent_dentry = parent_info->lower_paths[0].dentry;
+	inode_lock_nested(d_inode(lower_parent_dentry), I_MUTEX_PARENT);
+
+	/* 3. Lookup the new name in the physical layer */
+	lower_dentry = lookup_one_len_unlocked(dentry->d_name.name, lower_parent_dentry, dentry->d_name.len);
+	if (IS_ERR(lower_dentry)) {
+		err = PTR_ERR(lower_dentry);
+		goto out;
+	}
+
+	lower_path.dentry = lower_dentry;
+	lower_path.mnt = parent_info->lower_paths[0].mnt;
+
+	/* 4. Perform the actual creation */
+	err = vfs_create(MIRAGE_IDMAP(&lower_path), d_inode(lower_parent_dentry), lower_dentry, mode, want_excl);
+	if (err) {
+		dput(lower_dentry);
+		goto out;
+	}
+
+	/* 5. Update the virtual dentry with the newly created physical path */
+	info = mirage_dentry(dentry);
+	path_put(&info->lower_paths[0]);
+	pathcpy(&info->lower_paths[0], &lower_path);
+	path_get(&lower_path);
+	info->num_lower_paths = 1;
+
+	/* 6. Instantiate the new virtual inode */
+	new_inode = mirage_iget(dir->i_sb, d_inode(lower_dentry));
+	if (IS_ERR(new_inode)) {
+		err = PTR_ERR(new_inode);
+		goto out;
+	}
+	d_instantiate(dentry, new_inode);
 	err = 0;
 
+	/* Sync parent metadata */
 	fsstack_copy_attr_times(dir, mirage_lower_inode(dir));
 	fsstack_copy_inode_size(dir, d_inode(lower_parent_dentry));
 
 out:
-	unlock_dir(lower_parent_dentry);
+	inode_unlock(d_inode(lower_parent_dentry));
+	dput(parent_dentry);
 	return err;
 }
 
@@ -57,11 +80,9 @@ static int mirage_vfs_unlink(struct inode *dir, struct dentry *dentry)
 	err = vfs_unlink(MIRAGE_IDMAP(&info->lower_paths[0]), lower_dir_inode, lower_dentry, NULL);
 	if (err) goto out;
 
-	if (d_inode(dentry)) {
+	if (d_inode(dentry))
 		set_nlink(d_inode(dentry), mirage_lower_inode(d_inode(dentry))->i_nlink);
-		/* Sync deleted file ctime for apps holding open file descriptors */
-		fsstack_copy_attr_times(d_inode(dentry), mirage_lower_inode(d_inode(dentry)));
-	}
+
 	d_drop(dentry);
 out:
 	unlock_dir(lower_dir_dentry);
@@ -71,33 +92,55 @@ out:
 static int mirage_vfs_mkdir(IDMAP_ARG, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	int err;
-	struct dentry *alias;
-	struct dentry *lower_parent_dentry;
-	struct mirage_dentry_info *info = rcu_dereference_raw(dentry->d_fsdata);
+	struct dentry *lower_dentry, *lower_parent_dentry;
+	struct dentry *parent_dentry = dget_parent(dentry);
+	struct mirage_dentry_info *parent_info = mirage_dentry(parent_dentry);
+	struct mirage_dentry_info *info;
+	struct inode *new_inode;
+	struct path lower_path;
 	
-	struct path lower_path = info->lower_paths[0];
-	struct dentry *lower_dentry = lower_path.dentry;
+	if (!parent_info || !parent_info->lower_paths[0].dentry) {
+		dput(parent_dentry);
+		return -EINVAL;
+	}
 
-	lower_parent_dentry = lock_parent(lower_dentry);
+	lower_parent_dentry = parent_info->lower_paths[0].dentry;
+	inode_lock_nested(d_inode(lower_parent_dentry), I_MUTEX_PARENT);
+
+	lower_dentry = lookup_one_len_unlocked(dentry->d_name.name, lower_parent_dentry, dentry->d_name.len);
+	if (IS_ERR(lower_dentry)) {
+		err = PTR_ERR(lower_dentry);
+		goto out;
+	}
+
+	lower_path.dentry = lower_dentry;
+	lower_path.mnt = parent_info->lower_paths[0].mnt;
 
 	err = vfs_mkdir(MIRAGE_IDMAP(&lower_path), d_inode(lower_parent_dentry), lower_dentry, mode);
-	if (err) goto out;
-
-	alias = __mirage_interpose(dentry, dir->i_sb, &lower_path);
-	if (IS_ERR(alias)) {
-		err = PTR_ERR(alias);
+	if (err) {
+		dput(lower_dentry);
 		goto out;
-	} else if (alias && alias != dentry) {
-		dput(alias);
 	}
-	err = 0;
 
-	fsstack_copy_attr_times(dir, mirage_lower_inode(dir));
-	fsstack_copy_inode_size(dir, d_inode(lower_parent_dentry));
+	info = mirage_dentry(dentry);
+	path_put(&info->lower_paths[0]); 
+	pathcpy(&info->lower_paths[0], &lower_path);
+	path_get(&lower_path);
+	info->num_lower_paths = 1;
+
+	new_inode = mirage_iget(dir->i_sb, d_inode(lower_dentry));
+	if (IS_ERR(new_inode)) {
+		err = PTR_ERR(new_inode);
+		goto out;
+	}
+	d_instantiate(dentry, new_inode);
+	err = 0;
+	
 	set_nlink(dir, mirage_lower_inode(dir)->i_nlink);
 
 out:
-	unlock_dir(lower_parent_dentry);
+	inode_unlock(d_inode(lower_parent_dentry));
+	dput(parent_dentry);
 	return err;
 }
 
@@ -115,14 +158,9 @@ static int mirage_vfs_rmdir(struct inode *dir, struct dentry *dentry)
 	if (err) goto out;
 
 	d_drop(dentry);
-	if (d_inode(dentry)) {
+	if (d_inode(dentry))
 		clear_nlink(d_inode(dentry));
-		/* Sync deleted directory ctime */
-		fsstack_copy_attr_times(d_inode(dentry), mirage_lower_inode(d_inode(dentry)));
-	}
-	
-	fsstack_copy_attr_times(dir, d_inode(lower_dir_dentry));
-	fsstack_copy_inode_size(dir, d_inode(lower_dir_dentry));
+
 	set_nlink(dir, d_inode(lower_dir_dentry)->i_nlink);
 
 out:
@@ -133,32 +171,53 @@ out:
 static int mirage_vfs_symlink(IDMAP_ARG, struct inode *dir, struct dentry *dentry, const char *symname)
 {
 	int err;
-	struct dentry *alias;
-	struct dentry *lower_parent_dentry;
-	struct mirage_dentry_info *info = rcu_dereference_raw(dentry->d_fsdata);
-	
-	struct path lower_path = info->lower_paths[0];
-	struct dentry *lower_dentry = lower_path.dentry;
+	struct dentry *lower_dentry, *lower_parent_dentry;
+	struct dentry *parent_dentry = dget_parent(dentry);
+	struct mirage_dentry_info *parent_info = mirage_dentry(parent_dentry);
+	struct mirage_dentry_info *info;
+	struct inode *new_inode;
+	struct path lower_path;
 
-	lower_parent_dentry = lock_parent(lower_dentry);
+	if (!parent_info || !parent_info->lower_paths[0].dentry) {
+		dput(parent_dentry);
+		return -EINVAL;
+	}
+	
+	lower_parent_dentry = parent_info->lower_paths[0].dentry;
+	inode_lock_nested(d_inode(lower_parent_dentry), I_MUTEX_PARENT);
+
+	lower_dentry = lookup_one_len_unlocked(dentry->d_name.name, lower_parent_dentry, dentry->d_name.len);
+	if (IS_ERR(lower_dentry)) {
+		err = PTR_ERR(lower_dentry);
+		goto out;
+	}
+
+	lower_path.dentry = lower_dentry;
+	lower_path.mnt = parent_info->lower_paths[0].mnt;
 
 	err = vfs_symlink(MIRAGE_IDMAP(&lower_path), d_inode(lower_parent_dentry), lower_dentry, symname);
-	if (err) goto out;
-
-	alias = __mirage_interpose(dentry, dir->i_sb, &lower_path);
-	if (IS_ERR(alias)) {
-		err = PTR_ERR(alias);
+	if (err) {
+		dput(lower_dentry);
 		goto out;
-	} else if (alias && alias != dentry) {
-		dput(alias);
 	}
+
+	info = mirage_dentry(dentry);
+	path_put(&info->lower_paths[0]); 
+	pathcpy(&info->lower_paths[0], &lower_path);
+	path_get(&lower_path);
+	info->num_lower_paths = 1;
+
+	new_inode = mirage_iget(dir->i_sb, d_inode(lower_dentry));
+	if (IS_ERR(new_inode)) {
+		err = PTR_ERR(new_inode);
+		goto out;
+	}
+	d_instantiate(dentry, new_inode);
 	err = 0;
 
-	fsstack_copy_attr_times(dir, mirage_lower_inode(dir));
-	fsstack_copy_inode_size(dir, d_inode(lower_parent_dentry));
-
 out:
-	unlock_dir(lower_parent_dentry);
+	inode_unlock(d_inode(lower_parent_dentry));
+	dput(parent_dentry);
 	return err;
 }
 
@@ -217,28 +276,14 @@ static int mirage_vfs_rename(IDMAP_ARG, struct inode *old_dir, struct dentry *ol
 	/* Pass the flags down to the physical filesystem layer */
 	err = vfs_rename(d_inode(lower_old_dir_dentry), lower_old_dentry,
 			 d_inode(lower_new_dir_dentry), lower_new_dentry, NULL, flags);
-#endif
+#endif // LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 
 #else
 	err = vfs_rename(d_inode(lower_old_dir_dentry), lower_old_dentry,
 			 d_inode(lower_new_dir_dentry), lower_new_dentry);
-#endif
+#endif // RENAME_HAS_FLAGS
 
 	if (err) goto out;
-
-	fsstack_copy_attr_all(new_dir, d_inode(lower_new_dir_dentry));
-	fsstack_copy_inode_size(new_dir, d_inode(lower_new_dir_dentry));
-	if (new_dir != old_dir) {
-		fsstack_copy_attr_all(old_dir, d_inode(lower_old_dir_dentry));
-		fsstack_copy_inode_size(old_dir, d_inode(lower_old_dir_dentry));
-	}
-
-        /* * If the target dentry already existed (overwrite), sync its 
-	 * metadata to prevent stale "ghost" dentries in the VFS cache. 
-	 */
-	if (d_inode(new_dentry) && d_inode(lower_new_dentry)) {
-		fsstack_copy_attr_times(d_inode(new_dentry), d_inode(lower_new_dentry));
-	}
 
 out:
 	unlock_rename(lower_old_dir_dentry, lower_new_dir_dentry);
@@ -247,22 +292,32 @@ out:
 	return err;
 }
 
-static int mirage_vfs_getattr(IDMAP_ARG, const struct path *path, struct kstat *stat,
-			   u32 request_mask, unsigned int query_flags)
+static int mirage_vfs_getattr(IDMAP_ARG, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags)
 {
-	struct inode *inode = d_inode(path->dentry);
-	struct inode *lower_inode = mirage_lower_inode(inode);
+	struct mirage_dentry_info *info = rcu_dereference_raw(path->dentry->d_fsdata);
+	struct path *lower_path = &info->lower_paths[0];
+	struct inode *lower_inode = d_inode(lower_path->dentry);
+	int err;
 
+	if (likely(lower_inode->i_op->getattr)) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-	generic_fillattr(IDMAP_CALL, request_mask, lower_inode, stat);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-	generic_fillattr(IDMAP_CALL, lower_inode, stat);
+		err = lower_inode->i_op->getattr(MIRAGE_IDMAP(lower_path), lower_path, stat, request_mask, query_flags);
 #else
-	generic_fillattr(lower_inode, stat);
+		err = lower_inode->i_op->getattr(MIRAGE_IDMAP(lower_path), lower_path, stat, request_mask, query_flags);
 #endif
+	} else {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+		generic_fillattr(MIRAGE_IDMAP(lower_path), request_mask, lower_inode, stat);
+#else
+		generic_fillattr(MIRAGE_IDMAP(lower_path), lower_inode, stat);
+#endif
+		err = 0;
+	}
 
-	stat->dev = inode->i_sb->s_dev;
-	return 0;
+	if (likely(!err))
+		stat->dev = path->dentry->d_sb->s_dev;
+
+	return err;
 }
 
 static int mirage_vfs_setattr(IDMAP_ARG, struct dentry *dentry, struct iattr *ia)
@@ -283,97 +338,16 @@ static int mirage_vfs_setattr(IDMAP_ARG, struct dentry *dentry, struct iattr *ia
 	if (err) return err;
 
 	inode_lock(lower_inode);
-
-	if (ia->ia_valid & ATTR_SIZE) {
-		err = inode_newsize_ok(inode, ia->ia_size);
-		if (err) {
-			inode_unlock(lower_inode);
-			goto out;
-		}
-	}
-
 	err = notify_change(MIRAGE_IDMAP(&info->lower_paths[0]), lower_dentry, ia, NULL);
 	inode_unlock(lower_inode);
 
-	if (!err) {
-		if (ia->ia_valid & ATTR_SIZE)
-			truncate_setsize(inode, ia->ia_size);
-		fsstack_copy_attr_all(inode, lower_inode);
-	}
+	if (!err && (ia->ia_valid & ATTR_SIZE))
+		truncate_setsize(inode, ia->ia_size);
 
-out:
 	return err;
 }
 
 /* --- XATTR Handling --- */
-
-static ssize_t mirage_vfs_getxattr(struct dentry *dentry, struct inode *inode,
-				const char *name, void *buffer, size_t size)
-{
-	struct mirage_dentry_info *info;
-	struct dentry *ld;
-	ssize_t err = -EOPNOTSUPP;
-
-	info = rcu_dereference_raw(dentry->d_fsdata);
-	if (unlikely(!info || !info->lower_paths[0].dentry))
-		return err;
-
-	ld = info->lower_paths[0].dentry;
-
-	if (likely(d_is_positive(ld))) {
-		/* First check if the physical inode supports XATTRs using its native flag.
-		 * Then delegate the public call directly to the physical system. */
-		if (d_inode(ld)->i_opflags & IOP_XATTR) {
-			err = vfs_getxattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name, buffer, size);
-		}
-	}
-
-	return err;
-}
-
-static int mirage_vfs_setxattr(struct dentry *dentry, struct inode *inode, const char *name,
-			    const void *value, size_t size, int flags)
-{
-	struct mirage_dentry_info *info;
-	struct dentry *ld;
-	int err = -EOPNOTSUPP;
-
-	/* Extract raw pointer without atomic locks */
-	info = rcu_dereference_raw(dentry->d_fsdata);
-	if (unlikely(!info || !info->lower_paths[0].dentry))
-		return err;
-
-	ld = info->lower_paths[0].dentry;
-
-	if (likely(d_inode(ld)->i_opflags & IOP_XATTR)) {
-		err = vfs_setxattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name, value, size, flags);
-		if (!err) 
-			fsstack_copy_attr_all(inode, d_inode(ld));
-	}
-	return err;
-}
-
-static int mirage_vfs_removexattr(struct dentry *dentry, struct inode *inode, const char *name)
-{
-	struct mirage_dentry_info *info;
-	struct dentry *ld;
-	int err = -EOPNOTSUPP;
-
-	/* Extract raw pointer without atomic locks */
-	info = rcu_dereference_raw(dentry->d_fsdata);
-	if (unlikely(!info || !info->lower_paths[0].dentry))
-		return err;
-
-	ld = info->lower_paths[0].dentry;
-
-	if (likely(d_inode(ld)->i_opflags & IOP_XATTR)) {
-		err = vfs_removexattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name);
-		if (!err) 
-			fsstack_copy_attr_all(inode, d_inode(ld));
-	}
-	return err;
-}
-
 static ssize_t mirage_vfs_listxattr(struct dentry *dentry, char *buffer, size_t buffer_size)
 {
 	struct mirage_dentry_info *info;
@@ -386,33 +360,41 @@ static ssize_t mirage_vfs_listxattr(struct dentry *dentry, char *buffer, size_t 
 
 	ld = info->lower_paths[0].dentry;
 
-	if (likely(d_is_positive(ld) && (d_inode(ld)->i_opflags & IOP_XATTR))) {
+	if (likely(d_is_positive(ld) && (d_inode(ld)->i_opflags & IOP_XATTR)))
 		err = vfs_listxattr(ld, buffer, buffer_size);
-		if (!err)
-			fsstack_copy_attr_atime(d_inode(dentry), d_inode(ld));
-	}
 
 	return err;
 }
 
-/* --- Handlers XATTRs --- */
+/* --- Handlers XATTRs Directos --- */
 static int mirage_xattr_get(const struct xattr_handler *handler,
 			    struct dentry *dentry, struct inode *inode,
 			    const char *name, void *buffer, size_t size)
 {
-	return mirage_vfs_getxattr(dentry, inode, name, buffer, size);
+	struct mirage_dentry_info *info = rcu_dereference_raw(dentry->d_fsdata);
+	struct dentry *ld = info->lower_paths[0].dentry;
+
+	if (likely(d_is_positive(ld) && (d_inode(ld)->i_opflags & IOP_XATTR)))
+		return vfs_getxattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name, buffer, size);
+	
+	return -EOPNOTSUPP;
 }
 
 static int mirage_xattr_set(const struct xattr_handler *handler,
 			    IDMAP_ARG, struct dentry *dentry, struct inode *inode,
-			    const char *name, const void *value, size_t size,
-			    int flags)
+			    const char *name, const void *value, size_t size, int flags)
 {
+	struct mirage_dentry_info *info = rcu_dereference_raw(dentry->d_fsdata);
+	struct dentry *ld = info->lower_paths[0].dentry;
+
+	if (unlikely(!d_is_positive(ld) || !(d_inode(ld)->i_opflags & IOP_XATTR)))
+		return -EOPNOTSUPP;
+
 	if (value)
-		return mirage_vfs_setxattr(dentry, inode, name, value, size, flags);
+		return vfs_setxattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name, value, size, flags);
 
 	BUG_ON(flags != XATTR_REPLACE);
-	return mirage_vfs_removexattr(dentry, inode, name);
+	return vfs_removexattr(MIRAGE_IDMAP(&info->lower_paths[0]), ld, name);
 }
 
 const struct xattr_handler mirage_xattr_handler = {

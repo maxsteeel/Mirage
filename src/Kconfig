@@ -1,5 +1,5 @@
 config MIRAGE
-	tristate "Mirage virtal filesystem support"
+	tristate "Mirage virtual filesystem support"
 	help
 	  A stackable filesystem for Android content redirection.
 
@@ -9,7 +9,7 @@ config MIRAGE_KERNEL_UMOUNT
 	default n
 	help
 	  Enable kernel-level automatic umount support for Mirage.
-	  This allows NoMountFS to automatically unmount paths for app
+	  This allows Mirage to automatically unmount paths for app
 	  processes without depending on KernelSU or other external
 	  modules.
 
@@ -17,7 +17,7 @@ config MIRAGE_KERNEL_UMOUNT
 	  to trigger umount operations when zygote forks app processes.
 
 config MIRAGE_PROCFS
-	bool "NoMountFS procfs interface for umount management"
+	bool "Mirage procfs interface for umount management"
 	depends on MIRAGE_KERNEL_UMOUNT
 	default y
 	help
@@ -33,18 +33,3 @@ config MIRAGE_PROCFS
 
 	  If disabled, you can still manage the umount list via kernel
 	  hooks or module parameters, but not from userspace at runtime.
-
-config MIRAGE_RCU_PATH_ACCESS
-	bool "Mirage RCU-safe dentry access"
-	depends on MIRAGE
-	default y
-	help
-	  Enable RCU-safe lockless path walking for Mirage.
-	  This dramatically improves performance during concurrent
-	  directory lookups by avoiding spinlocks.
-
-	  It safely handles dentry private data freeing using
-	  kfree_rcu() to prevent use-after-free bugs when the VFS
-	  is in LOOKUP_RCU mode.
-
-	  If unsure, say Y.

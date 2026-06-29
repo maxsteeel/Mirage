@@ -1,22 +1,14 @@
 #
-# Makefile for NoMountFS
+# Makefile for Mirage
 #
-
 obj-$(CONFIG_MIRAGE) += mirage.o
 
-mirage-objs := main.o super.o inode.o file.o lookup.o dentry.o mmap.o 
-
 ifeq ($(CONFIG_MIRAGE_KERNEL_UMOUNT), y)
-mirage-objs += kernel_umount.o tp_hook.o
-ccflags-y += -DMIRAGE_FS_KERNEL_UMOUNT
-endif
-
-ifeq ($(CONFIG_MIRAGE_PROCFS), y)
-ccflags-y += -DMIRAGE_PROCFS
-endif
-
-ifeq ($(CONFIG_MIRAGE_RCU_PATH_ACCESS), y)
-ccflags-y += -DMIRAGE_RCU_PATH_ACCESS
+	mirage-objs += kernel_umount.o tp_hook.o
+	ccflags-y += -DMIRAGE_FS_KERNEL_UMOUNT
+	ifeq ($(CONFIG_MIRAGE_PROCFS), y)
+		ccflags-y += -DMIRAGE_PROCFS
+	endif
 endif
 
 # Detect if clone_private_mount is exported by this kernel.
@@ -27,4 +19,5 @@ ifeq ($(shell grep -c "clone_private_mount" \
 	ccflags-y += -DNO_CLONE_PRIVATE_MOUNT
 endif
 
-ccflags-y += -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers
+ccflags-y += -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -O3
+

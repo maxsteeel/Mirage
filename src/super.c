@@ -2,12 +2,6 @@
  * Mirage: Superblock operations and lifecycle management.
  */
 
-#include "mirage.h"
-#include "compat.h"
-
-#include <linux/security.h>
-#include <linux/uidgid.h>
-
 static struct kmem_cache *mirage_inode_cachep;
 
 #define MAX_SPOOF_TYPES 8
@@ -61,18 +55,8 @@ static struct inode *mirage_alloc_inode(struct super_block *sb)
 	struct mirage_inode_info *i;
 
 	i = kmem_cache_alloc(mirage_inode_cachep, GFP_KERNEL);
-	if (unlikely(!i))
+	if (!i)
 		return NULL;
-
-	/* Initialize private data and VFS inode */
-	memset((char *)i + sizeof(struct inode), 0, sizeof(*i) - sizeof(struct inode));
-	mirage_set_iversion(&i->vfs_inode, 1);
-
-	hash_init(i->dirent_hashtable);
-	INIT_LIST_HEAD(&i->dirents_list);
-	mutex_init(&i->readdir_mutex);
-	i->cache_populated = false;
-	i->cache_version = 0;
 
 	return &i->vfs_inode;
 }
@@ -96,37 +80,31 @@ static void mirage_put_super(struct super_block *sb)
 	struct mirage_sb_info *sbi = mirage_sb(sb);
 	int i;
 
-	if (!sbi)
-		return;
-
-	/* Release all lower path references acquired during fill_super */
 	for (i = 0; i < sbi->num_lower_paths; i++) {
-		if (sbi->lower_paths[i].dentry)
-			path_put(&sbi->lower_paths[i]);
+		kfree(sbi->lower_path_strs[i]);
 	}
-
-	if (sbi->has_inject)
-		path_put(&sbi->inject_path);
-
+	kfree(sbi->inject_name);
+	kfree(sbi->inject_path_str);
+    
 	kfree(sbi);
-	sb->s_fs_info = NULL;
 }
 
-int mirage_vfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+static int mirage_vfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct mirage_sb_info *sbi = mirage_sb(dentry->d_sb);
+	struct path *lower_path;
 	int err;
 
-	if (!sbi || sbi->num_lower_paths == 0) return -ENOSYS;
+	if (unlikely(!sbi || sbi->num_lower_paths == 0)) 
+        return -ENOSYS;
 
-	/* We always measure the actual physical disk (the last layer), 
-	 * ignoring if the current file comes from /data */
-	err = vfs_statfs(&sbi->lower_paths[sbi->num_lower_paths - 1], buf);
-	
+	lower_path = &sbi->lower_paths[sbi->num_lower_paths - 1];
+	err = lower_path->dentry->d_sb->s_op->statfs(lower_path->dentry, buf);
+
 	if (!err && sbi->lower_sb) {
 		buf->f_type = sbi->lower_sb->s_magic;
 	}
-	
+
 	return err;
 }
 
@@ -233,17 +211,17 @@ static int mirage_parse_options(struct super_block *sb, struct mirage_mount_opts
 		while ((p = strsep(&opts, ",")) != NULL) {
 			if (!*p) continue;
 			if (!strncmp(p, "lowerdir=", 9)) {
-				parsed_opts->path_to_mount = p + 9; // The word "lowerdir=" is skipped
+				parsed_opts->path_to_mount = kstrdup(p + 9, GFP_KERNEL); // The word "lowerdir=" is skipped
 			} else if (!strncmp(p, "upperdir=", 9)) {
-				parsed_opts->upperdir_str = p + 9; 
+				parsed_opts->upperdir_str = kstrdup(p + 9, GFP_KERNEL);
 			} else if (!strncmp(p, "inject_name=", 12)) {
-				parsed_opts->inject_name_str = p + 12;
+				parsed_opts->inject_name_str = kstrdup(p + 12, GFP_KERNEL);
 			} else if (!strncmp(p, "inject_path=", 12)) {
-				parsed_opts->inject_path_str = p + 12;
+				parsed_opts->inject_path_str = kstrdup(p + 12, GFP_KERNEL);
 			} else if (!strncmp(p, "target=", 7)) {
-				parsed_opts->target_str = p + 7;
+				parsed_opts->target_str = kstrdup(p + 7, GFP_KERNEL);
 			} else if (!strncmp(p, "source=", 7)) {
-				parsed_opts->source_str = p + 7;
+				parsed_opts->source_str = kstrdup(p + 7, GFP_KERNEL);
 			}
 		}
 	}
@@ -311,8 +289,7 @@ static int mirage_setup_direct_inject(struct mirage_sb_info *sbi, struct mirage_
 	}
 
 	/* Store the target filename for lookup interception */
-	strscpy(sbi->inject_name, target_path.dentry->d_name.name,
-		sizeof(sbi->inject_name));
+	sbi->inject_name = opts->inject_name_str;
 	sbi->inject_name_len = strlen(sbi->inject_name);
 	sbi->inject_name_hash = full_name_hash(NULL, sbi->inject_name, sbi->inject_name_len);
 	sbi->has_inject = true;
@@ -379,10 +356,9 @@ static int mirage_setup_branches(struct mirage_sb_info *sbi, struct mirage_mount
 		/* raw.mnt ref is now owned by the private clone; release it.
 		 * NOTE: Use path_put instead of mntput to prevent dentry memory leaks */
 		path_put(&raw);
-		strscpy(sbi->lower_path_strs[sbi->num_lower_paths],
-			opts->upperdir_str, PATH_MAX);
+		sbi->lower_path_strs[sbi->num_lower_paths] = kstrdup(branch_str, GFP_KERNEL);
 		sbi->num_lower_paths++;
-                sbi->has_upperdir = true;
+    sbi->has_upperdir = true;
 	}
 
 	/* Process lowerdir(s), splitting by : for union branches */
@@ -399,8 +375,7 @@ static int mirage_setup_branches(struct mirage_sb_info *sbi, struct mirage_mount
 				return err;
 			}
 			sbi->lower_paths[sbi->num_lower_paths].dentry = dget(raw.dentry);
-			sbi->lower_paths[sbi->num_lower_paths].mnt =
-				mirage_clone_private_mount(&raw);
+			sbi->lower_paths[sbi->num_lower_paths].mnt = mirage_clone_private_mount(&raw);
 			if (IS_ERR(sbi->lower_paths[sbi->num_lower_paths].mnt)) {
 				err = PTR_ERR(sbi->lower_paths[sbi->num_lower_paths].mnt);
 				sbi->lower_paths[sbi->num_lower_paths].mnt = NULL;
@@ -409,8 +384,7 @@ static int mirage_setup_branches(struct mirage_sb_info *sbi, struct mirage_mount
 			}
 			/* NOTE: Use path_put to balance the kern_path references */
 			path_put(&raw);
-			strscpy(sbi->lower_path_strs[sbi->num_lower_paths],
-				branch_str, PATH_MAX);
+			sbi->lower_path_strs[sbi->num_lower_paths] = kstrdup(branch_str, GFP_KERNEL);
 			sbi->num_lower_paths++;
 		}
 	}
@@ -459,12 +433,16 @@ static int mirage_setup_branches(struct mirage_sb_info *sbi, struct mirage_mount
 			return err;
 		}
 		path_put(&raw);
-		strscpy(sbi->inject_name, opts->inject_name_str, sizeof(sbi->inject_name));
+		sbi->inject_name = opts->inject_name_str;
 		sbi->inject_name_len = strlen(sbi->inject_name);
 		sbi->inject_name_hash = full_name_hash(NULL, sbi->inject_name, sbi->inject_name_len);
-		strscpy(sbi->inject_path_str, opts->inject_path_str, PATH_MAX);
+		sbi->inject_path_str = opts->inject_path_str;
 		sbi->has_inject = true;
-	}
+	} else {
+    sbi->inject_name = NULL;
+    sbi->inject_path_str = NULL;
+    sbi->has_inject = false;
+  }
 
 	return 0;
 }
@@ -494,14 +472,6 @@ static int mirage_setup_superblock(struct super_block *sb, struct mirage_sb_info
 	sb->s_d_op = &mirage_dops;
 	sb->s_export_op = &mirage_export_ops;
 	sb->s_xattr = mirage_xattr_handlers;
-
-	/*
-	 * Always use our own magic number. Spoofing the lower filesystem's
-	 * magic (e.g. ext4's 0xEF53) confuses SELinux's genfscon lookup,
-	 * which matches on both fs_type->name AND s_magic. With a spoofed
-	 * magic the kernel finds no matching genfscon entry for "mirage"
-	 * and falls back to unlabeled — defeating any sepolicy rules.
-	 */
 	sb->s_magic = MIRAGE_FS_MAGIC;
 
 	sb->s_maxbytes = sbi->lower_sb->s_maxbytes;
@@ -592,7 +562,7 @@ static void mirage_setup_selinux(struct super_block *sb, struct mirage_sb_info *
 	}
 }
 
-int mirage_fill_super(struct super_block *sb, void *raw_data, int silent)
+static int mirage_fill_super(struct super_block *sb, void *raw_data, int silent)
 {
 	struct mirage_sb_info *sbi;
 	struct mirage_mount_opts opts;
@@ -672,7 +642,7 @@ static void init_once(void *obj)
 	inode_init_once(&i->vfs_inode);
 }
 
-int mirage_init_inode_cache(void)
+static int mirage_init_inode_cache(void)
 {
 	/* SLAB_HWCACHE_ALIGN: Aligns objects to the CPU's L1/L2 cache lines.
 	 * This makes bulk inode allocations more fast.
@@ -683,7 +653,7 @@ int mirage_init_inode_cache(void)
 	return mirage_inode_cachep ? 0 : -ENOMEM;
 }
 
-void mirage_destroy_inode_cache(void)
+static void mirage_destroy_inode_cache(void)
 {
 	if (mirage_inode_cachep)
 		kmem_cache_destroy(mirage_inode_cachep);

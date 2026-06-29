@@ -1,11 +1,7 @@
 /*
  * Mirage: Path Resolution and Inode Management
  */
-#include <linux/security.h>
-#include "mirage.h"
-#include "compat.h"
 
-struct kmem_cache *mirage_dentry_cachep;
 extern struct dentry *lookup_one_len_unlocked(const char *name, struct dentry *base, int len);
 
 /* * Inode Cache: Handles the mapping between virtual and real inodes.
@@ -28,17 +24,16 @@ static int mirage_inode_set(struct inode *inode, void *opaque)
 	return 0;
 }
 
-/* * mieage_iget: Retrieves an existing virtual inode or creates a new one.
+/* * mirage_iget: Retrieves an existing virtual inode or creates a new one.
  */
-struct inode *mirage_iget(struct super_block *sb, struct inode *lower_inode)
+static struct inode *mirage_iget(struct super_block *sb, struct inode *lower_inode)
 {
 	struct inode *inode;
 
 	if (unlikely(!igrab(lower_inode)))
 		return ERR_PTR(-ESTALE);
 
-	/* Use hash lookup to find if we already have a virtual inode for this real one.
-	 * iget5_locked will call inode_set internally if it is a new inode */
+	/* Use hash lookup to find if we already have a virtual inode for this real one. */
 	inode = iget5_locked(sb, lower_inode->i_ino,
 			     mirage_inode_test, mirage_inode_set, lower_inode);
 
@@ -47,7 +42,6 @@ struct inode *mirage_iget(struct super_block *sb, struct inode *lower_inode)
 		return ERR_PTR(-ENOMEM);
 	}
 
-	/* If it's not a new inode, we already found it in cache */
 	if (!(inode->i_state & I_NEW)) {
 		iput(lower_inode);
 		return inode;
@@ -55,7 +49,6 @@ struct inode *mirage_iget(struct super_block *sb, struct inode *lower_inode)
 
 	/* Setup the new inode */
 	set_lower_inode(inode, lower_inode);
-	mirage_inc_iversion(inode);
 
 	/* Inherit operations based on type */
 	if (S_ISDIR(lower_inode->i_mode)) {
@@ -69,30 +62,14 @@ struct inode *mirage_iget(struct super_block *sb, struct inode *lower_inode)
 		inode->i_fop = &mirage_main_fops;
 	}
 
-	inode->i_mapping->a_ops = &mirage_aops;
-
 	/* Properly initialize special devices (char, block, fifo) */
 	if (unlikely(S_ISBLK(lower_inode->i_mode) || S_ISCHR(lower_inode->i_mode) ||
 	    S_ISFIFO(lower_inode->i_mode) || S_ISSOCK(lower_inode->i_mode)))
 		init_special_inode(inode, lower_inode->i_mode, lower_inode->i_rdev);
 
-	/* Sync metadata */
 	fsstack_copy_attr_all(inode, lower_inode);
 	fsstack_copy_inode_size(inode, lower_inode);
-
-	/* Copy SELinux label from lower inode.
-	 * Works for all inodes accessed after fill_super completes
-	 * (SBLABEL_MNT set). Root inode is relabeled separately in
-	 * fill_super after security_sb_set_mnt_opts.
-	 */
-	{
-		char *ctx = NULL;
-		unsigned int ctxlen = 0;
-		if (security_inode_getsecctx(lower_inode, (void **)&ctx, &ctxlen) == 0 && ctx) {
-			security_inode_notifysecctx(inode, ctx, ctxlen);
-			security_release_secctx(ctx, ctxlen);
-		}
-	}
+	inode->i_mapping = lower_inode->i_mapping;
 
 	/* Unlock the inode so the rest of the system can use it */
 	unlock_new_inode(inode);
@@ -101,7 +78,7 @@ struct inode *mirage_iget(struct super_block *sb, struct inode *lower_inode)
 
 /* * __mirage_interpose: Links a virtual dentry with its inode.
  */
-struct dentry *__mirage_interpose(struct dentry *dentry,
+static struct dentry *__mirage_interpose(struct dentry *dentry,
 					 struct super_block *sb,
 					 struct path *lower_path)
 {
@@ -118,8 +95,7 @@ struct dentry *__mirage_interpose(struct dentry *dentry,
 
 /* * mirage_vfs_lookup: The main entry point for path resolution.
  */
-struct dentry *mirage_vfs_lookup(struct inode *dir, struct dentry *dentry,
-			     unsigned int flags)
+static struct dentry *mirage_vfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
 	struct dentry *ret, *lower_dentry;
 	struct mirage_dentry_info *parent_info;
@@ -180,7 +156,6 @@ struct dentry *mirage_vfs_lookup(struct inode *dir, struct dentry *dentry,
 				/* follow_down failed — clean up and continue to next layer
 				 * path_put releases BOTH mnt and dentry */
 				path_put(&lower_path);
-				dput(lower_dentry);
 				continue;
 			}
 			lower_dentry = lower_path.dentry;
@@ -247,20 +222,4 @@ struct dentry *mirage_vfs_lookup(struct inode *dir, struct dentry *dentry,
 	 */
 
 	return ret;
-}
-
-/* --- Dentry Cache Initialization --- */
-
-int mirage_init_dentry_cache(void)
-{
-	mirage_dentry_cachep = kmem_cache_create("mirage_dentry_cache",
-											  sizeof(struct mirage_dentry_info),
-											  0, SLAB_RECLAIM_ACCOUNT | SLAB_HWCACHE_ALIGN, NULL);
-	return mirage_dentry_cachep ? 0 : -ENOMEM;
-}
-
-void mirage_destroy_dentry_cache(void)
-{
-	if (mirage_dentry_cachep)
-		kmem_cache_destroy(mirage_dentry_cachep);
 }

@@ -1,11 +1,15 @@
 /*
- * Mirage: Main entry point and filesystem registration.
+ * Mirage: A stackable virtual file system for Android content redirection.
+ *   Based on WrapFS by Erez Zadok.
+ *   This file is the main entry point and filesystem registration.
  */
 
 #include "mirage.h"
-#include "compat.h"
-
-#include <linux/module.h>
+#include "dentry.c"
+#include "lookup.c"
+#include "inode.c"
+#include "file.c"
+#include "super.c"
 
 struct cred *mirage_cred = NULL;
 
