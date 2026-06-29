@@ -65,9 +65,9 @@ extern void mirage_destroy_inode_cache(void);
 extern struct kmem_cache *mirage_dentry_cachep;
 extern int mirage_init_dentry_cache(void);
 extern void mirage_destroy_dentry_cache(void);
-extern struct kmem_cache *mirage_dirent_cachep;
-extern int mirage_init_dirent_cache(void);
-extern void mirage_destroy_dirent_cache(void);
+extern struct kmem_cache *mirage_file_cachep;
+extern int mirage_init_file_cache(void);
+extern void mirage_destroy_file_cache(void);
 extern int new_dentry_private_data(struct dentry *dentry);
 extern void free_dentry_private_data(struct dentry *dentry);
 
@@ -93,20 +93,10 @@ extern int mirage_set_inode(struct inode *inode, void *data);
 extern int mirage_init_tp_hooks(void);
 extern void mirage_exit_tp_hooks(void);
 
-/* Used to track already emitted dirents for deduplication */
-struct mirage_dirent {
-	struct hlist_node hash; /* For fast O(1) deduplication lookups */
-	struct list_head list;  /* For ordered O(1) emissions */
-	char name[NAME_MAX + 1];
-	int len; u64 ino;
-	unsigned int d_type;
-};
-
 /* File private data: link to the real underlying file(s) */
 struct mirage_file_info {
 	struct file *lower_files[MIRAGE_MAX_BRANCHES];
 	int num_lower_files;
-	bool ghost_emitted;
 };
 
 /* Inode data in memory */

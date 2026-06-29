@@ -7,20 +7,20 @@
 #include "compat.h"
 #include <linux/uio.h>
 
-struct kmem_cache *mirage_dirent_cachep;
+struct kmem_cache *mirage_file_cachep;
 
-int mirage_init_dirent_cache(void)
+int mirage_init_file_cache(void)
 {
-	mirage_dirent_cachep = kmem_cache_create("mirage_dirent_cache",
-											 sizeof(struct nomount_dirent), 0,
-											 SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD, NULL);
-	return mirage_dirent_cachep ? 0 : -ENOMEM;
+    mirage_file_cachep = kmem_cache_create("mirage_file_cache",
+                                           sizeof(struct mirage_file_info), 0,
+                                           SLAB_RECLAIM_ACCOUNT | SLAB_HWCACHE_ALIGN | SLAB_MEM_SPREAD, NULL);
+    return mirage_file_cachep ? 0 : -ENOMEM;
 }
 
-void mirage_destroy_dirent_cache(void)
+void mirage_destroy_file_cache(void)
 {
-	if (mirage_dirent_cachep)
-		kmem_cache_destroy(mirage_dirent_cachep);
+    if (mirage_file_cachep)
+        kmem_cache_destroy(mirage_file_cachep);
 }
 
 /* * mirage_vfs_open: called when a file is being opened.
@@ -36,7 +36,7 @@ static int mirage_vfs_open(struct inode *inode, struct file *file)
 	int i;
 
 	/* Allocate private storage for lower file reference */
-	info = kmem_cache_alloc(mirage_dirent_cachep, GFP_KERNEL);
+	info = kmem_cache_alloc(mirage_file_cachep, GFP_KERNEL);
 	if (unlikely(!info))
 		return -ENOMEM;
  
@@ -78,11 +78,11 @@ static int mirage_vfs_open(struct inode *inode, struct file *file)
 		for (i = 0; i < info->num_lower_files; i++) {
 			fput(info->lower_files[i]);
 		}
-		kmem_cache_free(mirage_dirent_cachep, info);
+		kmem_cache_free(mirage_file_cachep, info);
 		return err;
 	} else if (info->num_lower_files == 0) {
 		/* No files were opened — this is an error */
-		kmem_cache_free(mirage_dirent_cachep, info);
+		kmem_cache_free(mirage_file_cachep, info);
 		return -ENOENT;
 	} else {
 		file->private_data = info;
@@ -105,7 +105,7 @@ static int mirage_vfs_release(struct inode *inode, struct file *file)
 			}
 		}
 		
-		kmem_cache_free(nomount_dirent_cachep, info);
+		kmem_cache_free(mirage_file_cachep, info);
 		file->private_data = NULL;
 	}
 	return 0;
@@ -240,62 +240,65 @@ static ssize_t mirage_vfs_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 }
 #endif
 
-struct mirage_readdir_data {
-    struct dir_context ctx;
-    struct mirage_sb_info *sbi;
-    struct mirage_file_info *mfi;
-	struct mirage_inode_info *mii;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+    #define MIR_ACTOR_RET bool
+    #define MIR_ACTOR_CONTINUE true
+#else
+    #define MIR_ACTOR_RET int
+    #define MIR_ACTOR_CONTINUE 0
+#endif
+
+/* Embedded context proxy to bypass memory footprint during readdir */
+struct mirage_proxy_ctx {
+    struct dir_context ctx;          /* Fake context passed to lower layers */
+    struct dir_context *orig_ctx;    /* Original user space context */
+    struct mirage_sb_info *sbi;      /* Global superblock info for injections */
+    struct mirage_file_info *mfi;    /* File context to access sibling layer file structures */
+    int current_branch;              /* Index of the lower layer being currently read */
+    bool ghost_found;                /* Tracks if the ghost file was shadowed by a real one */
 };
 
-/* * mirage_vfs_filldir_cache: Fills the in-memory cache of directories.
- */
-static int mirage_vfs_filldir_cache(struct dir_context *ctx, const char *name, int namelen,
-                           loff_t offset, u64 ino, unsigned int d_type)
+/* The on-the-fly filter callback. Executes for EVERY entry discovered on disk */
+static MIR_ACTOR_RET mirage_proxy_actor(struct dir_context *ctx, const char *name, int namelen,
+                                        loff_t offset, u64 ino, unsigned int d_type)
 {
-    struct mirage_readdir_data *buf = container_of(ctx, struct nomount_readdir_data, ctx);
-    struct mirage_sb_info *sbi = buf->sbi;
-    struct mirage_inode_info *mii = buf->mii;
-	struct mirage_dirent *md;
-	u32 hash_val;
+    struct mirage_proxy_ctx *proxy = container_of(ctx, struct mirage_proxy_ctx, ctx);
+    struct mirage_sb_info *sbi = proxy->sbi;
+    struct mirage_file_info *mfi = proxy->mfi;
+    int i;
 
-	/* Calculate hash for fast lookup */
-	hash_val = full_name_hash(NULL, name, namelen);
-
-	/* O(1) deduplication check across branches */
-	hash_for_each_possible(mii->dirent_hashtable, md, hash, hash_val) {
-		if (md->len == namelen && memcmp(md->name, name, namelen) == 0) {
-			return 0; /* Already in cache, skip */
-		}
-	}
-
-    /* Check if this is the entry we are targeting for injection */
-    if (unlikely(sbi->has_inject && hash_val == sbi->inject_name_hash && 
-	namelen == sbi->inject_name_len && memcmp(name, sbi->inject_name, namelen) == 0)) {
+    /* 1. Explicit file injection/spoofing handler */
+    if (unlikely(sbi->has_inject && 
+                 namelen == sbi->inject_name_len && 
+                 memcmp(name, sbi->inject_name, namelen) == 0)) {
         
-        if (buf->mfi) {
-            buf->mfi->ghost_emitted = true;
-        }
-        /* Replace inode with the one from the injected file */
         ino = d_inode(sbi->inject_path.dentry)->i_ino;
-        d_type = DT_REG; 
+        d_type = DT_REG;
+        proxy->ghost_found = true;
     }
 
-	/* Allocation from the kmem_cache for improved performance */
-	md = kmem_cache_alloc(mirage_dirent_cachep, GFP_KERNEL);
-    if (unlikely(!md))
-        return -ENOMEM;
+    /* 2. Union Mount Deduplication 
+     * Scan all upper branches (from 0 up to current_branch - 1).
+     * If the filename already exists in a higher layer, it has been emitted.
+     */
+    for (i = 0; i < proxy->current_branch; i++) {
+        struct dentry *upper_dir = mfi->lower_files[i]->f_path.dentry;
+        struct dentry *child;
 
-    memcpy(md->name, name, namelen);
-    md->name[namelen] = '\0';
+        /* Query the kernel dcache directly without hitting physical disk */
+        child = lookup_one_len_unlocked(name, upper_dir, namelen);
+        if (!IS_ERR(child)) {
+            if (d_really_is_positive(child)) {
+                /* File exists in a higher layer; discard lower duplicate entry */
+                dput(child);
+                return MIR_ACTOR_CONTINUE;
+            }
+            dput(child);
+        }
+    }
 
-	md->len = namelen;
-	md->ino = ino;
-	md->d_type = d_type;
-		
-	hash_add(mii->dirent_hashtable, &md->hash, hash_val);
-	list_add_tail(&md->list, &mii->dirents_list);
-
-    return 0;
+    /* 3. Safe pass-through directly to the real user space buffer */
+    return proxy->orig_ctx->actor(proxy->orig_ctx, name, namelen, offset, ino, d_type);
 }
 
 #if defined(HAVE_ITERATE_SHARED) || defined(HAVE_ITERATE)
@@ -303,127 +306,54 @@ int mirage_vfs_iterate(struct file *file, struct dir_context *ctx)
 {
     struct mirage_sb_info *sbi = mirage_sb(file->f_inode->i_sb);
     struct mirage_file_info *mfi = mirage_file(file);
-	struct mirage_inode_info *mii = mirage_inode(file->f_inode);
-    int i, emit_idx = 0, err = 0;
     bool is_root = (file->f_path.dentry == file->f_inode->i_sb->s_root);
-	struct mirage_dirent *md, *tmp;
-	u64 current_version = 0;
+    loff_t nomount_magic_pos = 0x7000000000000000ULL;
+    int i, err = 0;
 
-        if (mfi->num_lower_files == 1 && (!is_root || !sbi->has_inject)) {
-		struct file *lower_file = mfi->lower_files[0];
+    /* Allocate the proxy context directly inside the CPU stack */
+    struct mirage_proxy_ctx proxy_ctx = {
+        .ctx.actor = mirage_proxy_actor,
+        .ctx.pos = ctx->pos,
+        .orig_ctx = ctx,
+        .sbi = sbi,
+        .mfi = mfi,
+        .current_branch = 0,
+        .ghost_found = false
+    };
 
-		/* Align physical file position with virtual context */
-		lower_file->f_pos = ctx->pos;
-#ifdef HAVE_ITERATE_SHARED
-		err = iterate_dir(lower_file, ctx);
-#else
-		if (!lower_file->f_op->iterate)
-			return -ENOTDIR;
-		err = lower_file->f_op->iterate(lower_file, ctx);
-#endif
-		/* Sync virtual position back */
-		file->f_pos = ctx->pos;
-		return err;
-	}
+    /* Phase 1: Stream and merge entries from all active filesystem layers */
+    if (ctx->pos < nomount_magic_pos) {
+        for (i = 0; i < mfi->num_lower_files; i++) {
+            struct file *lower_file = mfi->lower_files[i];
 
-	mutex_lock(&mii->readdir_mutex);
-
-        if (ctx->pos == 0) {
-	        /* Check invalidation based on lower files versions/mtimes */
-	        for (i = 0; i < nfi->num_lower_files; i++) {
-		        struct inode *lower_inode = file_inode(mfi->lower_files[i]);
-		        current_version += mirage_get_mtime(lower_inode);
-		        current_version += mirage_query_iversion(lower_inode);
-	        }
-
-	        if (mii->cache_populated && mii->cache_version != current_version) {
-		        mii->cache_populated = false; /* Invalidate */
-	        }
-	}
-
-	/* * Populate cache if starting from the beginning.
-     * If ctx->pos == 0 but the ghost has already been issued or the list is not empty,
-     * means that the user restarted reading from the same opened directory.
-     * We don't read the disk again, we use the RAM.
-     */
-	if (ctx->pos == 0 && !mii->cache_populated) {
-		list_for_each_entry_safe(md, tmp, &mii->dirents_list, list) {
-			hash_del(&md->hash);
-			list_del(&md->list);
-			kfree(md);
-		}
-		hash_init(mii->dirent_hashtable);
-		mfi->ghost_emitted = false;
-
-		/* Read all lower branches into memory to deduplicate safely */
-		for (i = 0; i < mfi->num_lower_files; i++) {
-			struct mirage_readdir_data buf;
-			struct file *lower_file = mfi->lower_files[i];
-
-			lower_file->f_pos = 0; /* Always scan full directory from start */
-			buf.ctx.actor = mirage_vfs_filldir_cache;
-			buf.ctx.pos = 0;
-			buf.sbi = sbi;
-			buf.nfi = mfi;
-			buf.nii = mii;
+            proxy_ctx.current_branch = i;
+            lower_file->f_pos = proxy_ctx.ctx.pos;
 
 #ifdef HAVE_ITERATE_SHARED
-			err = iterate_dir(lower_file, &buf.ctx);
+            err = iterate_dir(lower_file, &proxy_ctx.ctx);
 #else
-			if (!lower_file->f_op->iterate) {
-				err = -ENOTDIR;
-				break;
-			}
-			err = lower_file->f_op->iterate(lower_file, &buf.ctx);
+            if (!lower_file->f_op->iterate) return -ENOTDIR;
+            err = lower_file->f_op->iterate(lower_file, &proxy_ctx.ctx);
 #endif
-			if (err < 0) break;
-		}
+            proxy_ctx.ctx.pos = lower_file->f_pos;
+            if (err < 0) break;
+        }
+        
+        ctx->pos = proxy_ctx.ctx.pos;
+    }
 
-		/* Inject ghost file if it was missing in the cache */
-		if (err >= 0 && is_root && sbi->has_inject && !mfi->ghost_emitted) {
-			u64 fake_ino = d_inode(sbi->inject_path.dentry)->i_ino;
-			
-			md = kmalloc(sizeof(struct mirage_dirent) + sbi->inject_name_len + 1, GFP_KERNEL);
-			if (!md) {
-				err = -ENOMEM;
-			} else {
-                memcpy(md->name, sbi->inject_name, sbi->inject_name_len);
-                md->name[sbi->inject_name_len] = '\0';
-				
-				md->len = sbi->inject_name_len;
-				md->ino = fake_ino;
-				md->d_type = DT_REG;
-					
-				hash_add(mii->dirent_hashtable, &md->hash, sbi->inject_name_hash);
-				list_add_tail(&md->list, &mii->dirents_list);
-				mfi->ghost_emitted = true;
-			}
-		}
+    /* Phase 2: Synthetic ghost file append (Only if it wasn't shadowed) */
+    if (err >= 0 && is_root && sbi->has_inject) {
+        if (!proxy_ctx.ghost_found && ctx->pos <= nomount_magic_pos) {
+            u64 fake_ino = d_inode(sbi->inject_path.dentry)->i_ino;
+            ctx->pos = nomount_magic_pos;
+            if (dir_emit(ctx, sbi->inject_name, sbi->inject_name_len, fake_ino, DT_REG)) {
+                ctx->pos = nomount_magic_pos + 1;
+            }
+        }
+    }
 
-		if (err >= 0) {
-			mii->cache_populated = true;
-			mii->cache_version = current_version;
-		}
-	}
-
-	if (unlikely(err < 0))
-		goto out_unlock;
-
-	/* Emit entries sequentially from cache using simple integer pos */
-	list_for_each_entry(md, &mii->dirents_list, list) {
-		if (emit_idx >= ctx->pos) {
-			if (!dir_emit(ctx, md->name, md->len, md->ino, md->d_type)) {
-				break; /* User buffer is full, pause here */
-			}
-			ctx->pos++;
-		}
-		emit_idx++;
-	}
-
-	file->f_pos = ctx->pos;
-
-out_unlock:
-	mutex_unlock(&mii->readdir_mutex);
+    file->f_pos = ctx->pos;
     return err;
 }
 #else

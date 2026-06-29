@@ -66,15 +66,15 @@ static int __init init_mirage_vfs(void)
 	if (err)
 		goto out_free_inode_cache;
 		
-	/* 5. Initialize dirent cache */
-	err = mirage_init_dirent_cache();
+	/* 5. Initialize file cache */
+	err = mirage_init_file_cache();
 	if (err)
 		goto out_free_dentry_cache;
 
 	/* 6. Register the filesystem */
 	err = register_filesystem(&mirage_fs_type);
 	if (err)
-		goto out_free_dirent_cache;
+		goto out_free_file_cache;
 
 #ifdef MIRAGE_KERNEL_UMOUNT
 	/* 7. Initialize hooks */
@@ -88,8 +88,8 @@ static int __init init_mirage_vfs(void)
 
 out_unregister_fs:
 	unregister_filesystem(&mirage_fs_type);
-out_free_dirent_cache:
-	mirage_destroy_dirent_cache();
+out_free_file_cache:
+	mirage_destroy_file_cache();
 out_free_dentry_cache:
 	mirage_destroy_dentry_cache();
 out_free_inode_cache:
